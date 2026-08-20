@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+  <title>YouTabs Clone</title>
+
+  <style>
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      padding: 24px 16px;
+      background: #f5f5f7;
+      color: #1d1d1f;
+      font-family:
+        -apple-system,
+        BlinkMacSystemFont,
+        "Helvetica Neue",
+        sans-serif;
+    }
+
+    .container {
+      max-width: 600px;
+      margin: 0 auto;
+    }
+
+    h1 {
+      margin-bottom: 8px;
+      font-size: 30px;
+    }
+
+    .description {
+      color: #6e6e73;
+      margin-bottom: 30px;
+    }
+
+    .card {
+      background: white;
+      border-radius: 18px;
+      padding: 24px;
+      box-shadow: 0 4px 20px rgba(0, 0, 0, 0.08);
+    }
+
+    input[type="file"] {
+      width: 100%;
+      margin-bottom: 20px;
+    }
+
+    button {
+      width: 100%;
+      border: none;
+      border-radius: 12px;
+      padding: 15px;
+      background: #007aff;
+      color: white;
+      font-size: 17px;
+      font-weight: 600;
+      cursor: pointer;
+    }
+
+    button:disabled {
+      opacity: 0.5;
+    }
+
+    #status {
+      margin-top: 20px;
+      padding: 14px;
+      background: #f2f2f7;
+      border-radius: 12px;
+      white-space: pre-wrap;
+      line-height: 1.5;
+    }
+
+    #download {
+      display: none;
+      margin-top: 12px;
+      text-align: center;
+      text-decoration: none;
+      background: #34c759;
+      color: white;
+      padding: 15px;
+      border-radius: 12px;
+      font-weight: 600;
+    }
+  </style>
+</head>
+
+<body>
+
+  <main class="container">
+
+    <h1>YouTabs Clone</h1>
+
+    <p class="description">
+      音源からMIDIを自動生成します。
+    </p>
+
+    <div class="card">
+
+      <input
+        id="audio"
+        type="file"
+        accept="audio/*"
+      >
+
+      <button id="convert">
+        MIDIに変換
+      </button>
+
+      <div id="status">
+        音源を選択してください。
+      </div>
+
+      <a id="download">
+        MIDIを保存
+      </a>
+
+    </div>
+
+  </main>
+
+  <script type="module" src="/src/main.js"></script>
+
+</body>
+</html>
