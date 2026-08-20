@@ -1,0 +1,14 @@
+{
+  "name": "youtabs-clone",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@spotify/basic-pitch": "latest",
+    "vite": "latest"
+  }
+}
