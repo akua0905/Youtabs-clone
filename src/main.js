@@ -34,14 +34,16 @@ input.addEventListener("change", () => {
 button.addEventListener("click", async () => {
   try {
     if (!selectedFile) {
-      status.textContent = "先に音源を選択してください。";
+      status.textContent =
+        "先に音源を選択してください。";
       return;
     }
 
     button.disabled = true;
     download.style.display = "none";
 
-    status.textContent = "音源を読み込んでいます……";
+    status.textContent =
+      "音源を読み込んでいます……";
 
     const arrayBuffer =
       await selectedFile.arrayBuffer();
@@ -49,13 +51,27 @@ button.addEventListener("click", async () => {
     const audioContext =
       new AudioContext();
 
-    const audioBuffer =
-      await audioContext.decodeAudioData(arrayBuffer);
+    const originalBuffer =
+      await audioContext.decodeAudioData(
+        arrayBuffer
+      );
 
     status.textContent =
       `音源読み込み完了\n` +
-      `長さ: ${audioBuffer.duration.toFixed(1)}秒\n\n` +
-      `AIモデルを読み込んでいます……`;
+      `元のサンプルレート: ${originalBuffer.sampleRate} Hz\n` +
+      `長さ: ${originalBuffer.duration.toFixed(1)}秒\n\n` +
+      `22,050 Hzへ変換しています……`;
+
+    const audioBuffer =
+      await resampleAudio(
+        originalBuffer,
+        22050
+      );
+
+    await audioContext.close();
+
+    status.textContent =
+      "AIモデルを読み込んでいます……";
 
     await tf.setBackend("webgl");
     await tf.ready();
@@ -81,7 +97,9 @@ button.addEventListener("click", async () => {
 
       (progress) => {
         status.textContent =
-          `AI解析中……\n${Math.round(progress * 100)}%`;
+          `AI解析中……\n${Math.round(
+            progress * 100
+          )}%`;
       }
     );
 
@@ -132,7 +150,10 @@ button.addEventListener("click", async () => {
         midi: note.pitchMidi,
         time: note.startTimeSeconds,
         duration: note.durationSeconds,
-        velocity: note.amplitude
+        velocity: Math.max(
+          0.01,
+          Math.min(1, note.amplitude)
+        )
       });
     }
 
@@ -150,11 +171,12 @@ button.addEventListener("click", async () => {
 
     const filename =
       selectedFile.name
-        .replace(/\.[^/.]+$/, "")
-        + ".mid";
+        .replace(/\.[^/.]+$/, "") +
+      ".mid";
 
     download.href = url;
     download.download = filename;
+
     download.textContent =
       `MIDIを保存（${timedNotes.length}音）`;
 
@@ -166,17 +188,54 @@ button.addEventListener("click", async () => {
       `検出音符: ${timedNotes.length}\n` +
       `ファイル: ${filename}`;
 
-    await audioContext.close();
-
   } catch (error) {
 
     console.error(error);
 
     status.textContent =
-      "エラーが発生しました。\n\n" +
+      `エラーが発生しました。\n\n` +
       `${error.name}: ${error.message}`;
 
   } finally {
     button.disabled = false;
   }
 });
+
+
+async function resampleAudio(
+  sourceBuffer,
+  targetSampleRate
+) {
+  const numberOfChannels =
+    sourceBuffer.numberOfChannels;
+
+  const targetLength =
+    Math.ceil(
+      sourceBuffer.duration *
+      targetSampleRate
+    );
+
+  const offlineContext =
+    new OfflineAudioContext(
+      numberOfChannels,
+      targetLength,
+      targetSampleRate
+    );
+
+  const source =
+    offlineContext.createBufferSource();
+
+  source.buffer =
+    sourceBuffer;
+
+  source.connect(
+    offlineContext.destination
+  );
+
+  source.start(0);
+
+  const renderedBuffer =
+    await offlineContext.startRendering();
+
+  return renderedBuffer;
+}
