@@ -9,8 +9,8 @@
   },
   "dependencies": {
     "@spotify/basic-pitch": "1.0.1",
-    "@tensorflow/tfjs": "latest",
-    "@tonejs/midi": "latest",
+    "@tensorflow/tfjs": "3.18.0",
+    "@tonejs/midi": "2.0.28",
     "vite": "latest"
   }
 }
