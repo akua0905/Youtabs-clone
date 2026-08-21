@@ -19,7 +19,6 @@ let selectedFile = null;
 
 input.addEventListener("change", () => {
   selectedFile = input.files?.[0] ?? null;
-
   download.style.display = "none";
 
   if (!selectedFile) {
@@ -52,9 +51,7 @@ button.addEventListener("click", async () => {
       new AudioContext();
 
     const originalBuffer =
-      await audioContext.decodeAudioData(
-        arrayBuffer
-      );
+      await audioContext.decodeAudioData(arrayBuffer);
 
     status.textContent =
       `音源読み込み完了\n` +
@@ -97,9 +94,7 @@ button.addEventListener("click", async () => {
 
       (progress) => {
         status.textContent =
-          `AI解析中……\n${Math.round(
-            progress * 100
-          )}%`;
+          `AI解析中……\n${Math.round(progress * 100)}%`;
       }
     );
 
@@ -121,7 +116,7 @@ button.addEventListener("click", async () => {
         notes
       );
 
-    const timedNotes =
+    let timedNotes =
       noteFramesToTime(
         notesWithBends
       );
@@ -132,9 +127,32 @@ button.addEventListener("click", async () => {
       );
     }
 
+    // =========================================
+    // MIDI用ノート整理
+    // =========================================
+
+    const beforeCount =
+      timedNotes.length;
+
+    timedNotes =
+      mergeSamePitchNotes(timedNotes);
+
+    timedNotes =
+      removeTinyNotes(timedNotes);
+
+    timedNotes =
+      fillTinyGaps(timedNotes);
+
+    const afterCount =
+      timedNotes.length;
+
     status.textContent =
-      `MIDIを生成しています……\n` +
-      `${timedNotes.length}個の音符を検出`;
+      `音符を整理しています……\n` +
+      `${beforeCount}音 → ${afterCount}音`;
+
+    // =========================================
+    // MIDI生成
+    // =========================================
 
     const midi =
       new Midi();
@@ -146,15 +164,20 @@ button.addEventListener("click", async () => {
       "Basic Pitch";
 
     for (const note of timedNotes) {
+
       track.addNote({
         midi: note.pitchMidi,
         time: note.startTimeSeconds,
         duration: note.durationSeconds,
         velocity: Math.max(
           0.01,
-          Math.min(1, note.amplitude)
+          Math.min(
+            1,
+            note.amplitude ?? 0.8
+          )
         )
       });
+
     }
 
     const midiData =
@@ -185,7 +208,8 @@ button.addEventListener("click", async () => {
 
     status.textContent =
       `解析完了\n\n` +
-      `検出音符: ${timedNotes.length}\n` +
+      `解析前: ${beforeCount}音\n` +
+      `整理後: ${afterCount}音\n` +
       `ファイル: ${filename}`;
 
   } catch (error) {
@@ -197,15 +221,191 @@ button.addEventListener("click", async () => {
       `${error.name}: ${error.message}`;
 
   } finally {
+
     button.disabled = false;
+
   }
 });
 
+
+// ======================================================
+// 同じ音高の連続ノートを結合
+// ======================================================
+
+function mergeSamePitchNotes(notes) {
+
+  if (notes.length <= 1) {
+    return notes;
+  }
+
+  const sorted =
+    [...notes].sort(
+      (a, b) =>
+        a.startTimeSeconds -
+        b.startTimeSeconds
+    );
+
+  const result = [];
+
+  // これ以下の隙間なら「同じ音」とみなして結合
+  const MERGE_GAP = 0.08;
+
+  for (const note of sorted) {
+
+    const previous =
+      result[result.length - 1];
+
+    if (!previous) {
+
+      result.push({
+        ...note
+      });
+
+      continue;
+    }
+
+    const previousEnd =
+      previous.startTimeSeconds +
+      previous.durationSeconds;
+
+    const currentStart =
+      note.startTimeSeconds;
+
+    const gap =
+      currentStart -
+      previousEnd;
+
+    const samePitch =
+      previous.pitchMidi ===
+      note.pitchMidi;
+
+    if (
+      samePitch &&
+      gap >= -0.03 &&
+      gap <= MERGE_GAP
+    ) {
+
+      const currentEnd =
+        note.startTimeSeconds +
+        note.durationSeconds;
+
+      const newEnd =
+        Math.max(
+          previousEnd,
+          currentEnd
+        );
+
+      previous.durationSeconds =
+        newEnd -
+        previous.startTimeSeconds;
+
+      // 音量は大きい方を採用
+      previous.amplitude =
+        Math.max(
+          previous.amplitude ?? 0,
+          note.amplitude ?? 0
+        );
+
+    } else {
+
+      result.push({
+        ...note
+      });
+
+    }
+  }
+
+  return result;
+}
+
+
+// ======================================================
+// 極端に短いノートを削除
+// ======================================================
+
+function removeTinyNotes(notes) {
+
+  // 80ms未満の音を削除
+  const MIN_DURATION = 0.08;
+
+  return notes.filter(
+    note =>
+      note.durationSeconds >=
+      MIN_DURATION
+  );
+}
+
+
+// ======================================================
+// ごく短い隙間を埋める
+// ======================================================
+
+function fillTinyGaps(notes) {
+
+  if (notes.length <= 1) {
+    return notes;
+  }
+
+  const MAX_GAP = 0.05;
+
+  const sorted =
+    [...notes].sort(
+      (a, b) =>
+        a.startTimeSeconds -
+        b.startTimeSeconds
+    );
+
+  for (
+    let i = 0;
+    i < sorted.length - 1;
+    i++
+  ) {
+
+    const current =
+      sorted[i];
+
+    const next =
+      sorted[i + 1];
+
+    if (
+      current.pitchMidi !==
+      next.pitchMidi
+    ) {
+      continue;
+    }
+
+    const currentEnd =
+      current.startTimeSeconds +
+      current.durationSeconds;
+
+    const gap =
+      next.startTimeSeconds -
+      currentEnd;
+
+    if (
+      gap > 0 &&
+      gap <= MAX_GAP
+    ) {
+
+      current.durationSeconds +=
+        gap;
+
+    }
+  }
+
+  return sorted;
+}
+
+
+// ======================================================
+// 48kHzなどの音源を22.05kHzへ変換
+// ======================================================
 
 async function resampleAudio(
   sourceBuffer,
   targetSampleRate
 ) {
+
   const numberOfChannels =
     sourceBuffer.numberOfChannels;
 
@@ -234,8 +434,5 @@ async function resampleAudio(
 
   source.start(0);
 
-  const renderedBuffer =
-    await offlineContext.startRendering();
-
-  return renderedBuffer;
+  return await offlineContext.startRendering();
 }
