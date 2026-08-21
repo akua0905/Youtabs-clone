@@ -11,6 +11,8 @@
     "@spotify/basic-pitch": "1.0.1",
     "@tensorflow/tfjs": "3.18.0",
     "@tonejs/midi": "2.0.28",
+    "jszip": "3.10.1",
+    "onnxruntime-web": "latest",
     "vite": "latest"
   }
 }
