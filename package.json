@@ -9,6 +9,7 @@
   },
   "dependencies": {
     "@spotify/basic-pitch": "latest",
+    "@tonejs/midi": "latest",
     "onnxruntime-web": "latest",
     "jszip": "latest",
     "vite": "latest"
