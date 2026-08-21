@@ -1012,10 +1012,10 @@ async function analyzeToMidi(
 ) {
 
   // Basic Pitch用に22,050Hzへ
-  const audioBuffer =
-    createMonoAudioBuffer(
-      stereo
-    );
+const audioBuffer =
+  await createMonoAudioBuffer(
+    stereo
+  );
 
 
   const frames = [];
@@ -1161,7 +1161,7 @@ async function analyzeToMidi(
 // Stereo → Mono 22,050Hz
 // ============================================================
 
-function createMonoAudioBuffer(
+async function createMonoAudioBuffer(
   stereo
 ) {
 
