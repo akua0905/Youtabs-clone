@@ -1,16 +1,6 @@
 import * as ort from "onnxruntime-web";
-
-import * as tf from "@tensorflow/tfjs";
-
-import {
-  BasicPitch,
-  outputToNotesPoly,
-  addPitchBendsToNoteEvents,
-  noteFramesToTime
-} from "@spotify/basic-pitch";
-
+import { BasicPitch, outputToNotesPoly, addPitchBendsToNoteEvents, noteFramesToTime } from "@spotify/basic-pitch";
 import { Midi } from "@tonejs/midi";
-
 import JSZip from "jszip";
 
 
@@ -18,39 +8,25 @@ import JSZip from "jszip";
 // 設定
 // ============================================================
 
+const DEMUCS_MODEL =
+  "https://huggingface.co/StemSplitio/htdemucs-ft-vocals-onnx/resolve/main/htdemucs_ft_vocals_fp16weights.onnx";
+
 const BASIC_PITCH_MODEL =
   "https://cdn.jsdelivr.net/npm/@spotify/basic-pitch@1.0.1/model/model.json";
 
+const DEMUCS_SAMPLE_RATE = 44100;
+const BASIC_PITCH_SAMPLE_RATE = 22050;
 
-const DEMUCS_MODEL =
-  "https://huggingface.co/StemSplit/htdemucs/resolve/main/htdemucs_ft_vocals_fp16weights.onnx";
+const DEMUCS_SAMPLES = 343980;
+const DEMUCS_OVERLAP = Math.floor(DEMUCS_SAMPLES / 4);
+const DEMUCS_STRIDE = DEMUCS_SAMPLES - DEMUCS_OVERLAP;
 
+const VOCALS_STEM_ROW = 3;
 
-const DEMUCS_SAMPLE_RATE =
-  44100;
-
-
-const DEMUCS_SAMPLES =
-  343980;
-
-
-const DEMUCS_OVERLAP =
-  Math.floor(DEMUCS_SAMPLES / 4);
-
-
-const DEMUCS_STRIDE =
-  DEMUCS_SAMPLES - DEMUCS_OVERLAP;
-
-
-// MIDIテンポ
 const MIDI_BPM = 120;
 
-
-// ノート整理
 const MERGE_GAP = 0.08;
-
-const MIN_DURATION = 0.08;
-
+const MIN_NOTE_DURATION = 0.08;
 const MAX_FILL_GAP = 0.05;
 
 
@@ -58,16 +34,16 @@ const MAX_FILL_GAP = 0.05;
 // DOM
 // ============================================================
 
-const input =
+const audioInput =
   document.getElementById("audio");
 
-const button =
+const convertButton =
   document.getElementById("convert");
 
-const status =
+const statusElement =
   document.getElementById("status");
 
-const download =
+const downloadElement =
   document.getElementById("download");
 
 const progressBar =
@@ -85,11 +61,8 @@ let selectedFile = null;
 // UI
 // ============================================================
 
-function setStatus(text) {
-
-  status.textContent =
-    text;
-
+function setStatus(message) {
+  statusElement.textContent = message;
 }
 
 
@@ -106,7 +79,19 @@ function setProgress(value) {
 
   progressBar.style.width =
     `${percent}%`;
+}
 
+
+function waitForBrowser() {
+
+  return new Promise(
+    resolve => {
+      setTimeout(
+        resolve,
+        0
+      );
+    }
+  );
 }
 
 
@@ -114,14 +99,14 @@ function setProgress(value) {
 // ファイル選択
 // ============================================================
 
-input.addEventListener(
+audioInput.addEventListener(
   "change",
   () => {
 
     selectedFile =
-      input.files?.[0] ?? null;
+      audioInput.files?.[0] ?? null;
 
-    download.style.display =
+    downloadElement.style.display =
       "none";
 
     setProgress(0);
@@ -138,7 +123,6 @@ input.addEventListener(
     setStatus(
       `選択済み\n${selectedFile.name}`
     );
-
   }
 );
 
@@ -147,7 +131,7 @@ input.addEventListener(
 // メイン処理
 // ============================================================
 
-button.addEventListener(
+convertButton.addEventListener(
   "click",
   async () => {
 
@@ -161,161 +145,156 @@ button.addEventListener(
     }
 
 
-    button.disabled =
-      true;
+    convertButton.disabled = true;
 
-    download.style.display =
+    downloadElement.style.display =
       "none";
+
+
+    let demucsSession = null;
 
 
     try {
 
-      // ------------------------------------------------------
-      // 音源読み込み
-      // ------------------------------------------------------
+      // ======================================================
+      // 1. 音源読み込み
+      // ======================================================
 
       setStatus(
         "音源を読み込んでいます……"
       );
 
-      setProgress(0.02);
+      setProgress(0.01);
 
 
-      const arrayBuffer =
+      const fileBuffer =
         await selectedFile.arrayBuffer();
 
 
-      const audioContext =
-        new AudioContext();
-
-
-      const decoded =
-        await audioContext.decodeAudioData(
-          arrayBuffer
+      const decodedAudio =
+        await decodeAudio(
+          fileBuffer
         );
 
 
-      await audioContext.close();
-
-
-      // ------------------------------------------------------
-      // 44.1kHz ステレオ化
-      // ------------------------------------------------------
+      // ======================================================
+      // 2. Demucs用44.1kHz Stereo
+      // ======================================================
 
       setStatus(
         "音源を44.1kHzステレオに変換しています……"
       );
 
-      setProgress(0.05);
+      setProgress(0.04);
 
 
-      const stereo =
-        await resampleStereo(
-          decoded,
-          DEMUCS_SAMPLE_RATE
+      const demucsAudio =
+        await convertToStereo44100(
+          decodedAudio
         );
 
 
-      // ------------------------------------------------------
-      // Demucs
-      // ------------------------------------------------------
+      // 元音源を保持
+      const originalLeft =
+        demucsAudio.left;
+
+      const originalRight =
+        demucsAudio.right;
+
+
+      // ======================================================
+      // 3. Demucsモデル読み込み
+      // ======================================================
 
       setStatus(
-        "音源分離AIを準備しています……\n" +
+        "音源分離AIを読み込んでいます……\n" +
         "初回は約166MBのモデルを読み込みます。"
+      );
+
+      setProgress(0.06);
+
+
+      demucsSession =
+        await createDemucsSession();
+
+
+      // ======================================================
+      // 4. ボーカル抽出
+      // ======================================================
+
+      setStatus(
+        "ボーカルを分離しています……"
       );
 
       setProgress(0.08);
 
 
-      const session =
-        await createDemucsSession();
-
-
-      // ------------------------------------------------------
-      // WebGPU / WASM
-      // ------------------------------------------------------
-
-      setStatus(
-        "ボーカルと伴奏を分離しています……"
-      );
-
-
-      const separated =
-        await separateDemucs(
-          session,
-          stereo.left,
-          stereo.right,
+      const vocals =
+        await extractVocals(
+          demucsSession,
+          originalLeft,
+          originalRight,
           progress => {
 
             setProgress(
               0.08 +
-              progress * 0.52
+              progress * 0.47
             );
 
             setStatus(
-              `ボーカルと伴奏を分離しています……\n` +
+              "ボーカルを分離しています……\n" +
               `${Math.round(progress * 100)}%`
             );
-
           }
         );
 
 
-      // ------------------------------------------------------
-      // Demucsを解放
-      // ------------------------------------------------------
-
-      try {
-
-        await session.release();
-
-      } catch {}
-
-
-      // ------------------------------------------------------
-      // Instrumental生成
-      // ------------------------------------------------------
+      // ======================================================
+      // 5. 伴奏 = 元音源 - ボーカル
+      // ======================================================
 
       setStatus(
         "伴奏トラックを生成しています……"
       );
 
-      setProgress(0.62);
+      setProgress(0.57);
 
 
       const instrumental =
-        createInstrumental(
-          separated
+        subtractVocals(
+          originalLeft,
+          originalRight,
+          vocals.left,
+          vocals.right
         );
 
 
-      // ------------------------------------------------------
-      // Basic Pitch
-      // ------------------------------------------------------
+      // Demucs解放
+      try {
+
+        if (
+          demucsSession &&
+          typeof demucsSession.release === "function"
+        ) {
+
+          await demucsSession.release();
+
+        }
+
+      } catch {}
+
+      demucsSession = null;
+
+
+      // ======================================================
+      // 6. Basic Pitch準備
+      // ======================================================
 
       setStatus(
         "Basic Pitchを準備しています……"
       );
 
-      setProgress(0.64);
-
-
-      try {
-
-        await tf.setBackend(
-          "webgl"
-        );
-
-      } catch {
-
-        await tf.setBackend(
-          "cpu"
-        );
-
-      }
-
-      await tf.ready();
+      setProgress(0.60);
 
 
       const basicPitch =
@@ -324,25 +303,25 @@ button.addEventListener(
         );
 
 
-      // ------------------------------------------------------
-      // ボーカル採譜
-      // ------------------------------------------------------
+      // ======================================================
+      // 7. ボーカル → MIDI
+      // ======================================================
 
       setStatus(
         "ボーカルをMIDIに変換しています……"
       );
 
-      setProgress(0.66);
+      setProgress(0.62);
 
 
       const vocalsMidi =
-        await analyzeToMidi(
+        await audioToMidi(
           basicPitch,
-          separated.vocals,
+          vocals,
           progress => {
 
             setProgress(
-              0.66 +
+              0.62 +
               progress * 0.16
             );
 
@@ -350,35 +329,35 @@ button.addEventListener(
         );
 
 
-      // ------------------------------------------------------
-      // 伴奏採譜
-      // ------------------------------------------------------
+      // ======================================================
+      // 8. 伴奏 → MIDI
+      // ======================================================
 
       setStatus(
         "伴奏をMIDIに変換しています……"
       );
 
-      setProgress(0.83);
+      setProgress(0.79);
 
 
       const instrumentalMidi =
-        await analyzeToMidi(
+        await audioToMidi(
           basicPitch,
           instrumental,
           progress => {
 
             setProgress(
-              0.83 +
-              progress * 0.12
+              0.79 +
+              progress * 0.16
             );
 
           }
         );
 
 
-      // ------------------------------------------------------
-      // ZIP
-      // ------------------------------------------------------
+      // ======================================================
+      // 9. ZIP
+      // ======================================================
 
       setStatus(
         "ZIPファイルを生成しています……"
@@ -389,14 +368,6 @@ button.addEventListener(
 
       const zip =
         new JSZip();
-
-
-      const baseName =
-        selectedFile.name
-          .replace(
-            /\.[^/.]+$/,
-            ""
-          );
 
 
       zip.file(
@@ -424,19 +395,24 @@ button.addEventListener(
         );
 
 
-      download.href =
+      const baseName =
+        selectedFile.name
+          .replace(
+            /\.[^/.]+$/,
+            ""
+          );
+
+
+      downloadElement.href =
         url;
 
-
-      download.download =
+      downloadElement.download =
         `${baseName}_採譜.zip`;
 
-
-      download.textContent =
+      downloadElement.textContent =
         "ZIPを保存";
 
-
-      download.style.display =
+      downloadElement.style.display =
         "block";
 
 
@@ -444,10 +420,10 @@ button.addEventListener(
 
 
       setStatus(
-        `解析完了\n\n` +
-        `vocals.mid\n` +
-        `instrumental.mid\n\n` +
-        `ZIPにまとめました。`
+        "解析完了\n\n" +
+        "vocals.mid\n" +
+        "instrumental.mid\n\n" +
+        "ZIPにまとめました。"
       );
 
 
@@ -458,18 +434,40 @@ button.addEventListener(
       );
 
 
+      const message =
+        error instanceof Error
+          ? `${error.name}: ${error.message}`
+          : String(error);
+
+
       setStatus(
-        `エラーが発生しました。\n\n` +
-        `${error.name || "Error"}: ` +
-        `${error.message || error}`
+        "エラーが発生しました。\n\n" +
+        message
       );
 
 
       setProgress(0);
 
+
     } finally {
 
-      button.disabled =
+      if (demucsSession) {
+
+        try {
+
+          if (
+            typeof demucsSession.release === "function"
+          ) {
+
+            await demucsSession.release();
+
+          }
+
+        } catch {}
+
+      }
+
+      convertButton.disabled =
         false;
 
     }
@@ -479,24 +477,133 @@ button.addEventListener(
 
 
 // ============================================================
-// Demucsセッション
+// Audio Decode
+// ============================================================
+
+async function decodeAudio(
+  arrayBuffer
+) {
+
+  const context =
+    new AudioContext();
+
+
+  try {
+
+    return await context.decodeAudioData(
+      arrayBuffer.slice(0)
+    );
+
+  } finally {
+
+    try {
+
+      await context.close();
+
+    } catch {}
+
+  }
+
+}
+
+
+// ============================================================
+// 44.1kHz Stereo
+// ============================================================
+
+async function convertToStereo44100(
+  source
+) {
+
+  const targetRate =
+    DEMUCS_SAMPLE_RATE;
+
+
+  const targetLength =
+    Math.ceil(
+      source.duration *
+      targetRate
+    );
+
+
+  const offline =
+    new OfflineAudioContext(
+      2,
+      targetLength,
+      targetRate
+    );
+
+
+  const sourceNode =
+    offline.createBufferSource();
+
+
+  sourceNode.buffer =
+    source;
+
+
+  sourceNode.connect(
+    offline.destination
+  );
+
+
+  sourceNode.start(0);
+
+
+  const rendered =
+    await offline.startRendering();
+
+
+  const left =
+    rendered
+      .getChannelData(0)
+      .slice();
+
+
+  let right;
+
+
+  if (
+    rendered.numberOfChannels >= 2
+  ) {
+
+    right =
+      rendered
+        .getChannelData(1)
+        .slice();
+
+  } else {
+
+    right =
+      left.slice();
+
+  }
+
+
+  return {
+    left,
+    right
+  };
+
+}
+
+
+// ============================================================
+// Demucs Session
 // ============================================================
 
 async function createDemucsSession() {
 
-  ort.env.wasm.numThreads =
-    1;
+  ort.env.wasm.simd = true;
+
+  ort.env.wasm.numThreads = 1;
 
 
-  ort.env.wasm.simd =
-    true;
-
-
-  let executionProviders =
+  let providers =
     ["wasm"];
 
 
-  // WebGPUチェック
+  // WebGPUが利用可能なら優先
   if (
     "gpu" in navigator
   ) {
@@ -509,15 +616,18 @@ async function createDemucsSession() {
 
       if (adapter) {
 
-        executionProviders =
-          ["webgpu", "wasm"];
+        providers =
+          [
+            "webgpu",
+            "wasm"
+          ];
 
       }
 
     } catch {
 
       console.log(
-        "WebGPU unavailable."
+        "WebGPU is unavailable."
       );
 
     }
@@ -526,8 +636,8 @@ async function createDemucsSession() {
 
 
   console.log(
-    "Execution providers:",
-    executionProviders
+    "ONNX execution providers:",
+    providers
   );
 
 
@@ -535,7 +645,8 @@ async function createDemucsSession() {
     await ort.InferenceSession.create(
       DEMUCS_MODEL,
       {
-        executionProviders,
+        executionProviders:
+          providers,
 
         graphOptimizationLevel:
           "basic",
@@ -545,9 +656,20 @@ async function createDemucsSession() {
 
         enableMemPattern:
           false
-
       }
     );
+
+
+  console.log(
+    "Demucs inputs:",
+    session.inputNames
+  );
+
+
+  console.log(
+    "Demucs outputs:",
+    session.outputNames
+  );
 
 
   return session;
@@ -556,10 +678,10 @@ async function createDemucsSession() {
 
 
 // ============================================================
-// Demucs分離
+// Vocal Extraction
 // ============================================================
 
-async function separateDemucs(
+async function extractVocals(
 
   session,
 
@@ -582,18 +704,6 @@ async function separateDemucs(
 
 
   const vocalsRight =
-    new Float32Array(
-      total
-    );
-
-
-  const instrumentalLeft =
-    new Float32Array(
-      total
-    );
-
-
-  const instrumentalRight =
     new Float32Array(
       total
     );
@@ -627,13 +737,13 @@ async function separateDemucs(
 
 
   for (
-    let chunk = 0;
-    chunk < chunkCount;
-    chunk++
+    let chunkIndex = 0;
+    chunkIndex < chunkCount;
+    chunkIndex++
   ) {
 
     const start =
-      chunk *
+      chunkIndex *
       DEMUCS_STRIDE;
 
 
@@ -645,7 +755,7 @@ async function separateDemucs(
       );
 
 
-    const length =
+    const chunkLength =
       end -
       start;
 
@@ -656,7 +766,7 @@ async function separateDemucs(
     chunkBuffer
       .subarray(
         0,
-        length
+        chunkLength
       )
       .set(
         left.subarray(
@@ -670,7 +780,7 @@ async function separateDemucs(
       .subarray(
         DEMUCS_SAMPLES,
         DEMUCS_SAMPLES +
-        length
+        chunkLength
       )
       .set(
         right.subarray(
@@ -680,7 +790,7 @@ async function separateDemucs(
       );
 
 
-    const tensor =
+    const inputTensor =
       new ort.Tensor(
         "float32",
         chunkBuffer,
@@ -694,7 +804,8 @@ async function separateDemucs(
 
     const result =
       await session.run({
-        mix: tensor
+        mix:
+          inputTensor
       });
 
 
@@ -705,7 +816,8 @@ async function separateDemucs(
     if (!output) {
 
       throw new Error(
-        "Demucsの出力テンソル 'stems' が見つかりません。"
+        "Demucsの出力 'stems' が見つかりません。\n" +
+        `実際の出力: ${session.outputNames.join(", ")}`
       );
 
     }
@@ -716,40 +828,29 @@ async function separateDemucs(
 
 
     /*
-      Demucs 4-stem:
+      出力形状:
 
-      0 = drums
-      1 = bass
-      2 = other
-      3 = vocals
-
-      shape:
       [1, 4, 2, samples]
+
+      row 0 = drums
+      row 1 = bass
+      row 2 = other
+      row 3 = vocals
+
+      今回は vocals specialist なので
+      row 3 を使用する。
     */
 
 
-    const channels =
-      2;
-
-
-    const samples =
+    const rowOffset =
+      VOCALS_STEM_ROW *
+      2 *
       DEMUCS_SAMPLES;
-
-
-    const vocalRow =
-      3;
-
-
-    const instrumentalRows = [
-      0,
-      1,
-      2
-    ];
 
 
     for (
       let s = 0;
-      s < length;
+      s < chunkLength;
       s++
     ) {
 
@@ -757,83 +858,32 @@ async function separateDemucs(
         window[s];
 
 
-      const indexL =
-        (
-          vocalRow *
-          channels *
-          samples
-        ) +
-        s;
-
-
-      const indexR =
-        (
-          vocalRow *
-          channels *
-          samples
-        ) +
-        (
-          samples +
+      const vocalLeft =
+        data[
+          rowOffset +
           s
-        );
+        ];
+
+
+      const vocalRight =
+        data[
+          rowOffset +
+          DEMUCS_SAMPLES +
+          s
+        ];
 
 
       vocalsLeft[
         start + s
       ] +=
-        data[indexL] *
+        vocalLeft *
         w;
 
 
       vocalsRight[
         start + s
       ] +=
-        data[indexR] *
-        w;
-
-
-      let instL = 0;
-      let instR = 0;
-
-
-      for (
-        const row
-        of instrumentalRows
-      ) {
-
-        const offset =
-          row *
-          channels *
-          samples;
-
-
-        instL +=
-          data[
-            offset + s
-          ];
-
-
-        instR +=
-          data[
-            offset +
-            samples +
-            s
-          ];
-
-      }
-
-
-      instrumentalLeft[
-        start + s
-      ] +=
-        instL *
-        w;
-
-
-      instrumentalRight[
-        start + s
-      ] +=
-        instR *
+        vocalRight *
         w;
 
 
@@ -846,18 +896,17 @@ async function separateDemucs(
 
 
     onProgress(
-      (chunk + 1) /
+      (chunkIndex + 1) /
       chunkCount
     );
 
 
-    // iPhoneのメモリ負荷を下げる
-    await yieldToBrowser();
+    await waitForBrowser();
 
   }
 
 
-  // overlap-add 正規化
+  // Overlap-addの正規化
   for (
     let i = 0;
     i < total;
@@ -878,130 +927,84 @@ async function separateDemucs(
     vocalsRight[i] /=
       w;
 
-
-    instrumentalLeft[i] /=
-      w;
+  }
 
 
-    instrumentalRight[i] /=
-      w;
+  return {
+    left:
+      vocalsLeft,
+
+    right:
+      vocalsRight
+  };
+
+}
+
+
+// ============================================================
+// Instrumental = Original - Vocals
+// ============================================================
+
+function subtractVocals(
+
+  originalLeft,
+  originalRight,
+
+  vocalsLeft,
+  vocalsRight
+
+) {
+
+  const length =
+    originalLeft.length;
+
+
+  const instrumentalLeft =
+    new Float32Array(
+      length
+    );
+
+
+  const instrumentalRight =
+    new Float32Array(
+      length
+    );
+
+
+  for (
+    let i = 0;
+    i < length;
+    i++
+  ) {
+
+    instrumentalLeft[i] =
+      originalLeft[i] -
+      vocalsLeft[i];
+
+
+    instrumentalRight[i] =
+      originalRight[i] -
+      vocalsRight[i];
 
   }
 
 
   return {
-
-    vocals: {
-      left:
-        vocalsLeft,
-      right:
-        vocalsRight
-    },
-
-    instrumental: {
-      left:
-        instrumentalLeft,
-      right:
-        instrumentalRight
-    }
-
-  };
-
-}
-
-
-// ============================================================
-// ステレオ → 44.1kHz
-// ============================================================
-
-async function resampleStereo(
-
-  sourceBuffer,
-
-  targetRate
-
-) {
-
-  const targetLength =
-    Math.ceil(
-      sourceBuffer.duration *
-      targetRate
-    );
-
-
-  const offline =
-    new OfflineAudioContext(
-      2,
-      targetLength,
-      targetRate
-    );
-
-
-  const source =
-    offline.createBufferSource();
-
-
-  source.buffer =
-    sourceBuffer;
-
-
-  source.connect(
-    offline.destination
-  );
-
-
-  source.start(0);
-
-
-  const rendered =
-    await offline.startRendering();
-
-
-  return {
-
     left:
-      rendered
-        .getChannelData(0)
-        .slice(),
+      instrumentalLeft,
 
     right:
-      (
-        rendered.numberOfChannels > 1
-          ? rendered.getChannelData(1)
-          : rendered.getChannelData(0)
-      ).slice()
-
+      instrumentalRight
   };
 
 }
 
 
 // ============================================================
-// Instrumental生成
+// Audio → Basic Pitch → MIDI
 // ============================================================
 
-function createInstrumental(
-  separated
-) {
-
-  return {
-
-    left:
-      separated.instrumental.left,
-
-    right:
-      separated.instrumental.right
-
-  };
-
-}
-
-
-// ============================================================
-// Basic Pitch → MIDI
-// ============================================================
-
-async function analyzeToMidi(
+async function audioToMidi(
 
   basicPitch,
 
@@ -1011,11 +1014,10 @@ async function analyzeToMidi(
 
 ) {
 
-  // Basic Pitch用に22,050Hzへ
-const audioBuffer =
-  await createMonoAudioBuffer(
-    stereo
-  );
+  const audioBuffer =
+    await createBasicPitchAudioBuffer(
+      stereo
+    );
 
 
   const frames = [];
@@ -1028,14 +1030,22 @@ const audioBuffer =
     audioBuffer,
 
     (
-      f,
-      o,
-      c
+      frameBatch,
+      onsetBatch,
+      contourBatch
     ) => {
 
-      frames.push(...f);
-      onsets.push(...o);
-      contours.push(...c);
+      frames.push(
+        ...frameBatch
+      );
+
+      onsets.push(
+        ...onsetBatch
+      );
+
+      contours.push(
+        ...contourBatch
+      );
 
     },
 
@@ -1074,19 +1084,25 @@ const audioBuffer =
 
 
   timedNotes =
+    normalizeNoteObjects(
+      timedNotes
+    );
+
+
+  timedNotes =
     mergeSamePitchNotes(
       timedNotes
     );
 
 
   timedNotes =
-    removeTinyNotes(
+    removeShortNotes(
       timedNotes
     );
 
 
   timedNotes =
-    fillTinyGaps(
+    fillSmallGaps(
       timedNotes
     );
 
@@ -1105,6 +1121,13 @@ const audioBuffer =
     new Midi();
 
 
+  /*
+    音源の実時間を維持する。
+
+    MIDIのtempoを変えて
+    ノートの秒位置を変えない。
+  */
+
   midi.header.setTempo(
     MIDI_BPM
   );
@@ -1119,33 +1142,52 @@ const audioBuffer =
     of timedNotes
   ) {
 
-    track.addNote({
+    const pitch =
+      Math.round(
+        note.pitchMidi
+      );
 
-      midi:
-        Math.round(
-          note.pitchMidi
-        ),
 
-      time:
-        Math.max(
-          0,
-          note.startTimeSeconds
-        ),
+    const time =
+      Math.max(
+        0,
+        note.startTimeSeconds
+      );
 
-      duration:
-        Math.max(
-          0.01,
-          note.durationSeconds
-        ),
 
-      velocity:
-        Math.max(
-          0.01,
-          Math.min(
-            1,
+    const duration =
+      Math.max(
+        0.01,
+        note.durationSeconds
+      );
+
+
+    const velocity =
+      Math.max(
+        0.01,
+
+        Math.min(
+          1,
+          Number(
             note.amplitude ?? 0.8
           )
         )
+      );
+
+
+    track.addNote({
+
+      midi:
+        pitch,
+
+      time:
+        time,
+
+      duration:
+        duration,
+
+      velocity:
+        velocity
 
     });
 
@@ -1158,19 +1200,23 @@ const audioBuffer =
 
 
 // ============================================================
-// Stereo → Mono 22,050Hz
+// Basic Pitch用 AudioBuffer
 // ============================================================
 
-async function createMonoAudioBuffer(
+async function createBasicPitchAudioBuffer(
   stereo
 ) {
 
+  const sourceRate =
+    DEMUCS_SAMPLE_RATE;
+
+
+  const targetRate =
+    BASIC_PITCH_SAMPLE_RATE;
+
+
   const length =
     stereo.left.length;
-
-
-  const sampleRate =
-    DEMUCS_SAMPLE_RATE;
 
 
   const mono =
@@ -1195,73 +1241,23 @@ async function createMonoAudioBuffer(
   }
 
 
-  const targetRate =
-    22050;
+  const sourceBuffer =
+    new AudioBuffer({
+      length:
+        length,
+
+      numberOfChannels:
+        1,
+
+      sampleRate:
+        sourceRate
+    });
 
 
-  const targetLength =
-    Math.ceil(
-      length *
-      targetRate /
-      sampleRate
-    );
-
-
-  const offline =
-    new OfflineAudioContext(
-      1,
-      targetLength,
-      targetRate
-    );
-
-
-  const buffer =
-    offline.createBuffer(
-      1,
-      length,
-      sampleRate
-    );
-
-
-  buffer
+  sourceBuffer
     .getChannelData(0)
     .set(mono);
 
-
-  const source =
-    offline.createBufferSource();
-
-
-  source.buffer =
-    buffer;
-
-
-  source.connect(
-    offline.destination
-  );
-
-
-  source.start(0);
-
-
-  // OfflineAudioContextを同期的には返せないので、
-  // 下のPromise版を使用する
-  return resampleMonoBuffer(
-    buffer,
-    targetRate
-  );
-
-}
-
-
-// ============================================================
-// Mono resample
-// ============================================================
-
-async function resampleMonoBuffer(
-  sourceBuffer,
-  targetRate
-) {
 
   const targetLength =
     Math.ceil(
@@ -1294,13 +1290,83 @@ async function resampleMonoBuffer(
   source.start(0);
 
 
-  return await offline.startRendering();
+  const rendered =
+    await offline.startRendering();
+
+
+  return rendered;
 
 }
 
 
 // ============================================================
-// 同音高ノート結合
+// MIDI Note Normalization
+// ============================================================
+
+function normalizeNoteObjects(
+  notes
+) {
+
+  return notes.map(
+    note => {
+
+      const start =
+        Number(
+          note.startTimeSeconds ??
+          note.startTime ??
+          0
+        );
+
+
+      const duration =
+        Number(
+          note.durationSeconds ??
+          note.duration ??
+          0
+        );
+
+
+      const pitch =
+        Number(
+          note.pitchMidi ??
+          note.pitch ??
+          0
+        );
+
+
+      const amplitude =
+        Number(
+          note.amplitude ??
+          0.8
+        );
+
+
+      return {
+
+        ...note,
+
+        startTimeSeconds:
+          start,
+
+        durationSeconds:
+          duration,
+
+        pitchMidi:
+          pitch,
+
+        amplitude:
+          amplitude
+
+      };
+
+    }
+  );
+
+}
+
+
+// ============================================================
+// 同音ノート結合
 // ============================================================
 
 function mergeSamePitchNotes(
@@ -1327,7 +1393,7 @@ function mergeSamePitchNotes(
     );
 
 
-  const result = [];
+  const merged = [];
 
 
   for (
@@ -1336,14 +1402,14 @@ function mergeSamePitchNotes(
   ) {
 
     const previous =
-      result[
-        result.length - 1
+      merged[
+        merged.length - 1
       ];
 
 
     if (!previous) {
 
-      result.push({
+      merged.push({
         ...note
       });
 
@@ -1355,6 +1421,11 @@ function mergeSamePitchNotes(
     const previousEnd =
       previous.startTimeSeconds +
       previous.durationSeconds;
+
+
+    const noteEnd =
+      note.startTimeSeconds +
+      note.durationSeconds;
 
 
     const gap =
@@ -1377,17 +1448,11 @@ function mergeSamePitchNotes(
       gap <= MERGE_GAP
     ) {
 
-      const end =
+      previous.durationSeconds =
         Math.max(
           previousEnd,
-
-          note.startTimeSeconds +
-          note.durationSeconds
-        );
-
-
-      previous.durationSeconds =
-        end -
+          noteEnd
+        ) -
         previous.startTimeSeconds;
 
 
@@ -1399,7 +1464,7 @@ function mergeSamePitchNotes(
 
     } else {
 
-      result.push({
+      merged.push({
         ...note
       });
 
@@ -1408,33 +1473,33 @@ function mergeSamePitchNotes(
   }
 
 
-  return result;
+  return merged;
 
 }
 
 
 // ============================================================
-// 短すぎる音を削除
+// 短すぎるノート削除
 // ============================================================
 
-function removeTinyNotes(
+function removeShortNotes(
   notes
 ) {
 
   return notes.filter(
     note =>
       note.durationSeconds >=
-      MIN_DURATION
+      MIN_NOTE_DURATION
   );
 
 }
 
 
 // ============================================================
-// 小さな隙間を補正
+// 小さな隙間を埋める
 // ============================================================
 
-function fillTinyGaps(
+function fillSmallGaps(
   notes
 ) {
 
@@ -1505,7 +1570,7 @@ function fillTinyGaps(
 
 
 // ============================================================
-// Demucs overlap window
+// Demucs Transition Window
 // ============================================================
 
 function makeTransitionWindow(
@@ -1548,22 +1613,5 @@ function makeTransitionWindow(
 
 
   return window;
-
-}
-
-
-// ============================================================
-// iPhoneでUIを固めない
-// ============================================================
-
-function yieldToBrowser() {
-
-  return new Promise(
-    resolve =>
-      setTimeout(
-        resolve,
-        0
-      )
-  );
 
 }
