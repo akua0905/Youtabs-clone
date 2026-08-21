@@ -1,39 +1,44 @@
-import * as ort from "onnxruntime-web";
 import {
   BasicPitch,
   outputToNotesPoly,
   addPitchBendsToNoteEvents,
   noteFramesToTime
 } from "@spotify/basic-pitch";
+
 import { Midi } from "@tonejs/midi";
-import JSZip from "jszip";
 
 
 // ============================================================
 // 設定
 // ============================================================
 
-const DEMUCS_MODEL =
-  "https://huggingface.co/StemSplitio/htdemucs-ft-vocals-onnx/resolve/main/htdemucs_ft_vocals_fp16weights.onnx";
-
 const BASIC_PITCH_MODEL =
   "https://cdn.jsdelivr.net/npm/@spotify/basic-pitch@1.0.1/model/model.json";
 
-const DEMUCS_SAMPLE_RATE = 44100;
 const BASIC_PITCH_SAMPLE_RATE = 22050;
 
-const DEMUCS_SAMPLES = 343980;
-const DEMUCS_OVERLAP = Math.floor(DEMUCS_SAMPLES / 4);
-const DEMUCS_STRIDE =
-  DEMUCS_SAMPLES - DEMUCS_OVERLAP;
 
-const VOCALS_STEM_ROW = 3;
+// ------------------------------------------------------------
+// MIDI後処理設定
+// ------------------------------------------------------------
 
+// これ未満のノートは誤検出として削除
+const MIN_NOTE_DURATION = 0.07;
+
+// 同じ音程でこの時間以内なら結合
+const MERGE_GAP = 0.12;
+
+// ほぼ重なっている同音ノートを統合
+const OVERLAP_TOLERANCE = 0.05;
+
+// 同一音程のノート間にある小さな隙間を埋める
+const FILL_GAP = 0.08;
+
+// 音量が極端に小さいノートを除去
+const MIN_AMPLITUDE = 0.08;
+
+// MIDIテンポ
 const MIDI_BPM = 120;
-
-const MERGE_GAP = 0.08;
-const MIN_NOTE_DURATION = 0.08;
-const MAX_FILL_GAP = 0.05;
 
 
 // ============================================================
@@ -70,7 +75,8 @@ let selectedFile = null;
 function setStatus(message) {
 
   if (statusElement) {
-    statusElement.textContent = message;
+    statusElement.textContent =
+      message;
   }
 
 }
@@ -97,15 +103,14 @@ function setProgress(value) {
 }
 
 
-function waitForBrowser() {
+function yieldBrowser() {
 
   return new Promise(
-    resolve => {
+    resolve =>
       setTimeout(
         resolve,
         0
-      );
-    }
+      )
   );
 
 }
@@ -122,12 +127,21 @@ audioInput.addEventListener(
     selectedFile =
       audioInput.files?.[0] ?? null;
 
+
     if (downloadElement) {
+
       downloadElement.style.display =
         "none";
+
+      downloadElement.removeAttribute(
+        "href"
+      );
+
     }
 
+
     setProgress(0);
+
 
     if (!selectedFile) {
 
@@ -136,10 +150,19 @@ audioInput.addEventListener(
       );
 
       return;
+
     }
 
+
+    const sizeMB =
+      selectedFile.size /
+      1024 /
+      1024;
+
+
     setStatus(
-      `選択済み\n${selectedFile.name}`
+      `選択済み\n${selectedFile.name}\n` +
+      `${sizeMB.toFixed(1)} MB`
     );
 
   }
@@ -147,7 +170,7 @@ audioInput.addEventListener(
 
 
 // ============================================================
-// メイン処理
+// メイン
 // ============================================================
 
 convertButton.addEventListener(
@@ -161,189 +184,84 @@ convertButton.addEventListener(
       );
 
       return;
+
     }
 
 
-    convertButton.disabled = true;
+    convertButton.disabled =
+      true;
+
 
     if (downloadElement) {
+
       downloadElement.style.display =
         "none";
+
     }
-
-
-    let demucsSession = null;
 
 
     try {
 
-      // ======================================================
+      // ------------------------------------------------------
       // 1. 音源読み込み
-      // ======================================================
+      // ------------------------------------------------------
 
       setStatus(
         "音源を読み込んでいます……"
       );
 
-      setProgress(0.01);
+      setProgress(0.03);
 
 
-      const fileBuffer =
+      const arrayBuffer =
         await selectedFile.arrayBuffer();
 
 
-      const decodedAudio =
+      const decoded =
         await decodeAudio(
-          fileBuffer
+          arrayBuffer
         );
 
 
       if (
-        !decodedAudio ||
-        decodedAudio.length <= 0
+        !decoded ||
+        decoded.length <= 0
       ) {
 
         throw new Error(
-          "音源を正常に読み込めませんでした。"
+          "音源を読み込めませんでした。"
         );
 
       }
 
 
-      // ======================================================
-      // 2. 44.1kHz Stereo
-      // ======================================================
+      // ------------------------------------------------------
+      // 2. ステレオ → モノラル + 22050Hz
+      // ------------------------------------------------------
 
       setStatus(
-        "音源を44.1kHzステレオに変換しています……"
+        "採譜用音声を生成しています……\n" +
+        `${decoded.sampleRate} Hz → 22050 Hz`
       );
 
-      setProgress(0.04);
+      setProgress(0.10);
 
 
-      const demucsAudio =
-        await convertToStereo44100(
-          decodedAudio
+      const audioBuffer =
+        await createBasicPitchAudioBuffer(
+          decoded
         );
 
 
-      const originalLeft =
-        demucsAudio.left;
-
-      const originalRight =
-        demucsAudio.right;
-
-
-      // ======================================================
-      // 3. Demucs読み込み
-      // ======================================================
+      // ------------------------------------------------------
+      // 3. Basic Pitch
+      // ------------------------------------------------------
 
       setStatus(
-        "音源分離AIを読み込んでいます……\n" +
-        "初回はモデルの読み込みに時間がかかります。"
+        "Basic Pitchで採譜しています……"
       );
 
-      setProgress(0.06);
-
-
-      demucsSession =
-        await createDemucsSession();
-
-
-      // ======================================================
-      // 4. Demucsモデル仕様確認
-      // ======================================================
-
-      validateDemucsModel(
-        demucsSession
-      );
-
-
-      // ======================================================
-      // 5. ボーカル抽出
-      // ======================================================
-
-      setStatus(
-        "ボーカル／伴奏を分離しています……"
-      );
-
-      setProgress(0.08);
-
-
-      const vocals =
-        await extractVocals(
-          demucsSession,
-          originalLeft,
-          originalRight,
-          progress => {
-
-            setProgress(
-              0.08 +
-              progress * 0.47
-            );
-
-            setStatus(
-              "ボーカル／伴奏を分離しています……\n" +
-              `${Math.round(progress * 100)}%`
-            );
-
-          }
-        );
-
-
-      // ======================================================
-      // 6. 伴奏生成
-      // ======================================================
-
-      setStatus(
-        "伴奏トラックを生成しています……"
-      );
-
-      setProgress(0.57);
-
-
-      const instrumental =
-        subtractVocals(
-          originalLeft,
-          originalRight,
-          vocals.left,
-          vocals.right
-        );
-
-
-      // ======================================================
-      // 7. Demucs解放
-      // ======================================================
-
-      try {
-
-        if (
-          demucsSession &&
-          typeof demucsSession.release ===
-            "function"
-        ) {
-
-          await demucsSession.release();
-
-        }
-
-      } catch {}
-
-      demucsSession = null;
-
-
-      await waitForBrowser();
-
-
-      // ======================================================
-      // 8. Basic Pitch
-      // ======================================================
-
-      setStatus(
-        "Basic Pitchを準備しています……"
-      );
-
-      setProgress(0.60);
+      setProgress(0.15);
 
 
       const basicPitch =
@@ -352,101 +270,212 @@ convertButton.addEventListener(
         );
 
 
-      // ======================================================
-      // 9. ボーカル → MIDI
-      // ======================================================
+      const frames = [];
+      const onsets = [];
+      const contours = [];
 
-      setStatus(
-        "ボーカルをMIDIに変換しています……"
+
+      await basicPitch.evaluateModel(
+
+        audioBuffer,
+
+        (
+          frameBatch,
+          onsetBatch,
+          contourBatch
+        ) => {
+
+          frames.push(
+            ...frameBatch
+          );
+
+          onsets.push(
+            ...onsetBatch
+          );
+
+          contours.push(
+            ...contourBatch
+          );
+
+        },
+
+        progress => {
+
+          setProgress(
+            0.15 +
+            progress * 0.55
+          );
+
+
+          setStatus(
+            "Basic Pitchで採譜しています……\n" +
+            `${Math.round(progress * 100)}%`
+          );
+
+        }
+
       );
 
-      setProgress(0.62);
+
+      await yieldBrowser();
 
 
-      const vocalsMidi =
-        await audioToMidi(
-          basicPitch,
-          vocals,
-          progress => {
+      // ------------------------------------------------------
+      // 4. ノート生成
+      // ------------------------------------------------------
 
-            setProgress(
-              0.62 +
-              progress * 0.16
-            );
+      setStatus(
+        "MIDIノートを整理しています……"
+      );
 
-          }
+      setProgress(0.72);
+
+
+      let notes =
+        outputToNotesPoly(
+          frames,
+          onsets,
+
+          // frame threshold
+          0.20,
+
+          // onset threshold
+          0.20,
+
+          // minimum note length
+          4
         );
 
 
-      await waitForBrowser();
+      // ------------------------------------------------------
+      // 5. Pitch Bend
+      // ------------------------------------------------------
 
-
-      // ======================================================
-      // 10. 伴奏 → MIDI
-      // ======================================================
-
-      setStatus(
-        "伴奏をMIDIに変換しています……"
-      );
-
-      setProgress(0.79);
-
-
-      const instrumentalMidi =
-        await audioToMidi(
-          basicPitch,
-          instrumental,
-          progress => {
-
-            setProgress(
-              0.79 +
-              progress * 0.16
-            );
-
-          }
+      notes =
+        addPitchBendsToNoteEvents(
+          contours,
+          notes
         );
 
 
-      await waitForBrowser();
+      // ------------------------------------------------------
+      // 6. フレーム → 秒
+      // ------------------------------------------------------
+
+      let timedNotes =
+        noteFramesToTime(
+          notes
+        );
 
 
-      // ======================================================
-      // 11. ZIP
-      // ======================================================
+      // ------------------------------------------------------
+      // 7. 正規化
+      // ------------------------------------------------------
+
+      timedNotes =
+        normalizeNotes(
+          timedNotes
+        );
+
+
+      // ------------------------------------------------------
+      // 8. 低振幅ノイズ削除
+      // ------------------------------------------------------
+
+      timedNotes =
+        removeLowAmplitudeNotes(
+          timedNotes
+        );
+
+
+      // ------------------------------------------------------
+      // 9. 短すぎるノート削除
+      // ------------------------------------------------------
+
+      timedNotes =
+        removeShortNotes(
+          timedNotes
+        );
+
+
+      // ------------------------------------------------------
+      // 10. 同音程ノート統合
+      // ------------------------------------------------------
+
+      timedNotes =
+        mergeSamePitchNotes(
+          timedNotes
+        );
+
+
+      // ------------------------------------------------------
+      // 11. 小さな隙間を補正
+      // ------------------------------------------------------
+
+      timedNotes =
+        fillSmallGaps(
+          timedNotes
+        );
+
+
+      // ------------------------------------------------------
+      // 12. 重複ノート整理
+      // ------------------------------------------------------
+
+      timedNotes =
+        removeOverlappingSamePitchNotes(
+          timedNotes
+        );
+
+
+      // ------------------------------------------------------
+      // 13. 最終整理
+      // ------------------------------------------------------
+
+      timedNotes =
+        finalCleanUp(
+          timedNotes
+        );
+
+
+      // ------------------------------------------------------
+      // 14. MIDI生成
+      // ------------------------------------------------------
 
       setStatus(
-        "ZIPファイルを生成しています……"
+        "MIDIファイルを生成しています……"
       );
 
-      setProgress(0.96);
+      setProgress(0.88);
 
 
-      const zip =
-        new JSZip();
+      const midi =
+        createMidi(
+          timedNotes
+        );
 
 
-      zip.file(
-        "vocals.mid",
-        vocalsMidi
-      );
+      const midiData =
+        midi.toArray();
 
 
-      zip.file(
-        "instrumental.mid",
-        instrumentalMidi
-      );
+      // ------------------------------------------------------
+      // 15. Blob
+      // ------------------------------------------------------
 
-
-      const zipBlob =
-        await zip.generateAsync({
-          type: "blob",
-          compression: "DEFLATE"
-        });
+      const blob =
+        new Blob(
+          [midiData],
+          {
+            type:
+              "audio/midi"
+          }
+        );
 
 
       const url =
         URL.createObjectURL(
-          zipBlob
+          blob
         );
 
 
@@ -458,17 +487,21 @@ convertButton.addEventListener(
           );
 
 
-      downloadElement.href =
-        url;
+      if (downloadElement) {
 
-      downloadElement.download =
-        `${baseName}_採譜.zip`;
+        downloadElement.href =
+          url;
 
-      downloadElement.textContent =
-        "ZIPを保存";
+        downloadElement.download =
+          `${baseName}_採譜.mid`;
 
-      downloadElement.style.display =
-        "block";
+        downloadElement.textContent =
+          "MIDIを保存";
+
+        downloadElement.style.display =
+          "block";
+
+      }
 
 
       setProgress(1);
@@ -476,16 +509,15 @@ convertButton.addEventListener(
 
       setStatus(
         "解析完了\n\n" +
-        "vocals.mid\n" +
-        "instrumental.mid\n\n" +
-        "ZIPにまとめました。"
+        `検出ノート数：${timedNotes.length}\n\n` +
+        "「MIDIを保存」から保存できます。"
       );
 
 
     } catch (error) {
 
       console.error(
-        "YouTabs Clone Error:",
+        "Basic Pitch Error:",
         error
       );
 
@@ -504,25 +536,7 @@ convertButton.addEventListener(
 
       setProgress(0);
 
-
     } finally {
-
-      if (demucsSession) {
-
-        try {
-
-          if (
-            typeof demucsSession.release ===
-              "function"
-          ) {
-
-            await demucsSession.release();
-
-          }
-
-        } catch {}
-
-      }
 
       convertButton.disabled =
         false;
@@ -565,970 +579,84 @@ async function decodeAudio(
 
 
 // ============================================================
-// 44.1kHz Stereo
-// ============================================================
-
-async function convertToStereo44100(
-  source
-) {
-
-  const targetRate =
-    DEMUCS_SAMPLE_RATE;
-
-
-  const targetLength =
-    Math.max(
-      1,
-      Math.ceil(
-        source.duration *
-        targetRate
-      )
-    );
-
-
-  const offline =
-    new OfflineAudioContext(
-      2,
-      targetLength,
-      targetRate
-    );
-
-
-  const sourceNode =
-    offline.createBufferSource();
-
-
-  sourceNode.buffer =
-    source;
-
-
-  sourceNode.connect(
-    offline.destination
-  );
-
-
-  sourceNode.start(0);
-
-
-  const rendered =
-    await offline.startRendering();
-
-
-  const left =
-    rendered
-      .getChannelData(0)
-      .slice();
-
-
-  let right;
-
-
-  if (
-    rendered.numberOfChannels >= 2
-  ) {
-
-    right =
-      rendered
-        .getChannelData(1)
-        .slice();
-
-  } else {
-
-    right =
-      left.slice();
-
-  }
-
-
-  return {
-    left,
-    right
-  };
-
-}
-
-
-// ============================================================
-// Demucs Session
-// ============================================================
-
-async function createDemucsSession() {
-
-  ort.env.wasm.simd = true;
-
-  ort.env.wasm.numThreads = 1;
-
-  ort.env.wasm.proxy = false;
-
-
-  const providers =
-    ["wasm"];
-
-
-  console.log(
-    "ONNX Runtime:",
-    ort.env
-  );
-
-
-  console.log(
-    "Demucs model:",
-    DEMUCS_MODEL
-  );
-
-
-  console.log(
-    "Creating Demucs session..."
-  );
-
-
-  const session =
-    await ort.InferenceSession.create(
-      DEMUCS_MODEL,
-      {
-        executionProviders:
-          providers,
-
-        graphOptimizationLevel:
-          "basic",
-
-        enableCpuMemArena:
-          false,
-
-        enableMemPattern:
-          false
-      }
-    );
-
-
-  console.log(
-    "Demucs input names:",
-    session.inputNames
-  );
-
-
-  console.log(
-    "Demucs input metadata:",
-    session.inputMetadata
-  );
-
-
-  console.log(
-    "Demucs output names:",
-    session.outputNames
-  );
-
-
-  console.log(
-    "Demucs output metadata:",
-    session.outputMetadata
-  );
-
-
-  return session;
-
-}
-
-
-// ============================================================
-// Demucsモデル仕様確認
-// ============================================================
-
-function validateDemucsModel(
-  session
-) {
-
-  if (
-    !session.inputNames ||
-    session.inputNames.length === 0
-  ) {
-
-    throw new Error(
-      "Demucsモデルに入力が存在しません。"
-    );
-
-  }
-
-
-  const inputName =
-    session.inputNames[0];
-
-
-  const metadata =
-    session.inputMetadata?.[inputName];
-
-
-  console.log(
-    "Actual Demucs input:",
-    inputName,
-    metadata
-  );
-
-
-  /*
-    正しいモデル:
-
-    name:
-      mix
-
-    dimensions:
-      [1, 2, 343980]
-
-    dtype:
-      float32
-  */
-
-
-  if (
-    inputName !== "mix"
-  ) {
-
-    throw new Error(
-      "読み込んだDemucsモデルの入力名が想定と異なります。\n\n" +
-      `実際: ${inputName}\n` +
-      "期待: mix\n\n" +
-      "モデルURLまたはモデルファイルが正しくありません。"
-    );
-
-  }
-
-
-  const dimensions =
-    metadata?.dimensions;
-
-
-  if (
-    !dimensions ||
-    dimensions.length !== 3
-  ) {
-
-    throw new Error(
-      "Demucsモデルの入力次元数が異なります。\n\n" +
-      `実際: ${JSON.stringify(dimensions)}\n` +
-      "期待: [1, 2, 343980]\n\n" +
-      "別のONNXモデルを読み込んでいる可能性があります。"
-    );
-
-  }
-
-
-  const expected =
-    [
-      1,
-      2,
-      DEMUCS_SAMPLES
-    ];
-
-
-  for (
-    let i = 0;
-    i < expected.length;
-    i++
-  ) {
-
-    const actual =
-      dimensions[i];
-
-
-    /*
-      ONNX Runtimeでは
-      dynamic dimensionが
-      null / undefined / -1
-      になる場合があるため、
-      その場合は固定値チェックを
-      スキップする。
-    */
-
-    if (
-      actual === null ||
-      actual === undefined ||
-      actual === -1 ||
-      actual === "?"
-    ) {
-
-      continue;
-
-    }
-
-
-    if (
-      Number(actual) !==
-      expected[i]
-    ) {
-
-      throw new Error(
-        "Demucsモデルの入力形状が想定と違います。\n\n" +
-        `実際: ${JSON.stringify(dimensions)}\n` +
-        `期待: ${JSON.stringify(expected)}\n\n` +
-        "現在のモデルURLが正しいHT-Demucsモデルを指しているか確認してください。"
-      );
-
-    }
-
-  }
-
-
-  console.log(
-    "Demucs model shape OK:",
-    dimensions
-  );
-
-}
-
-
-// ============================================================
-// Vocal Extraction
-// ============================================================
-
-async function extractVocals(
-  session,
-  left,
-  right,
-  onProgress
-) {
-
-  const total =
-    left.length;
-
-
-  const vocalsLeft =
-    new Float32Array(
-      total
-    );
-
-
-  const vocalsRight =
-    new Float32Array(
-      total
-    );
-
-
-  const weight =
-    new Float32Array(
-      total
-    );
-
-
-  const window =
-    makeTransitionWindow(
-      DEMUCS_SAMPLES,
-      DEMUCS_OVERLAP
-    );
-
-
-  const chunkBuffer =
-    new Float32Array(
-      2 *
-      DEMUCS_SAMPLES
-    );
-
-
-  const chunkCount =
-    Math.max(
-      1,
-      Math.ceil(
-        total /
-        DEMUCS_STRIDE
-      )
-    );
-
-
-  const inputName =
-    session.inputNames[0];
-
-
-  const outputName =
-    session.outputNames.includes(
-      "stems"
-    )
-      ? "stems"
-      : session.outputNames[0];
-
-
-  for (
-    let chunkIndex = 0;
-    chunkIndex < chunkCount;
-    chunkIndex++
-  ) {
-
-    const start =
-      chunkIndex *
-      DEMUCS_STRIDE;
-
-
-    const end =
-      Math.min(
-        start +
-        DEMUCS_SAMPLES,
-        total
-      );
-
-
-    const chunkLength =
-      end -
-      start;
-
-
-    chunkBuffer.fill(0);
-
-
-    chunkBuffer
-      .subarray(
-        0,
-        chunkLength
-      )
-      .set(
-        left.subarray(
-          start,
-          end
-        )
-      );
-
-
-    chunkBuffer
-      .subarray(
-        DEMUCS_SAMPLES,
-        DEMUCS_SAMPLES +
-        chunkLength
-      )
-      .set(
-        right.subarray(
-          start,
-          end
-        )
-      );
-
-
-    /*
-      ここが重要。
-
-      HT-Demucs FT vocals ONNX:
-
-      [1, 2, 343980]
-
-      44.1kHz stereo
-    */
-
-    const inputTensor =
-      new ort.Tensor(
-        "float32",
-        chunkBuffer,
-        [
-          1,
-          2,
-          DEMUCS_SAMPLES
-        ]
-      );
-
-
-    /*
-      実行前にshapeを確認。
-    */
-
-    console.log(
-      "Running Demucs:",
-      {
-        inputName,
-        shape:
-          inputTensor.dims,
-        length:
-          inputTensor.data.length
-      }
-    );
-
-
-    let result;
-
-
-    try {
-
-      result =
-        await session.run({
-          [inputName]:
-            inputTensor
-        });
-
-    } catch (error) {
-
-      throw new Error(
-        "Demucsの推論に失敗しました。\n\n" +
-        (
-          error instanceof Error
-            ? error.message
-            : String(error)
-        ) +
-        "\n\n" +
-        "入力shape: [1, 2, 343980]"
-      );
-
-    }
-
-
-    const output =
-      result[outputName];
-
-
-    if (!output) {
-
-      throw new Error(
-        "Demucsの出力が見つかりません。\n\n" +
-        `出力名: ${session.outputNames.join(", ")}`
-      );
-
-    }
-
-
-    console.log(
-      "Demucs output:",
-      output.dims
-    );
-
-
-    /*
-      正しい出力:
-
-      [1, 4, 2, 343980]
-    */
-
-    if (
-      !output.dims ||
-      output.dims.length !== 4
-    ) {
-
-      throw new Error(
-        "Demucsの出力shapeが想定と違います。\n\n" +
-        `実際: ${JSON.stringify(output.dims)}\n` +
-        "期待: [1, 4, 2, 343980]"
-      );
-
-    }
-
-
-    const data =
-      output.data;
-
-
-    const channels =
-      2;
-
-
-    const samples =
-      DEMUCS_SAMPLES;
-
-
-    const stemCount =
-      4;
-
-
-    const rowOffset =
-      VOCALS_STEM_ROW *
-      channels *
-      samples;
-
-
-    for (
-      let s = 0;
-      s < chunkLength;
-      s++
-    ) {
-
-      const w =
-        window[s];
-
-
-      const vocalLeft =
-        data[
-          rowOffset +
-          s
-        ];
-
-
-      const vocalRight =
-        data[
-          rowOffset +
-          samples +
-          s
-        ];
-
-
-      vocalsLeft[
-        start + s
-      ] +=
-        vocalLeft *
-        w;
-
-
-      vocalsRight[
-        start + s
-      ] +=
-        vocalRight *
-        w;
-
-
-      weight[
-        start + s
-      ] +=
-        w;
-
-    }
-
-
-    onProgress(
-      (chunkIndex + 1) /
-      chunkCount
-    );
-
-
-    /*
-      Safariに制御を返す。
-    */
-
-    await waitForBrowser();
-
-  }
-
-
-  // ==========================================================
-  // Overlap-add正規化
-  // ==========================================================
-
-  for (
-    let i = 0;
-    i < total;
-    i++
-  ) {
-
-    const w =
-      Math.max(
-        weight[i],
-        1e-8
-      );
-
-
-    vocalsLeft[i] /=
-      w;
-
-
-    vocalsRight[i] /=
-      w;
-
-  }
-
-
-  return {
-    left:
-      vocalsLeft,
-
-    right:
-      vocalsRight
-  };
-
-}
-
-
-// ============================================================
-// Instrumental
-// ============================================================
-
-function subtractVocals(
-  originalLeft,
-  originalRight,
-  vocalsLeft,
-  vocalsRight
-) {
-
-  const length =
-    originalLeft.length;
-
-
-  const instrumentalLeft =
-    new Float32Array(
-      length
-    );
-
-
-  const instrumentalRight =
-    new Float32Array(
-      length
-    );
-
-
-  for (
-    let i = 0;
-    i < length;
-    i++
-  ) {
-
-    instrumentalLeft[i] =
-      originalLeft[i] -
-      vocalsLeft[i];
-
-
-    instrumentalRight[i] =
-      originalRight[i] -
-      vocalsRight[i];
-
-  }
-
-
-  return {
-    left:
-      instrumentalLeft,
-
-    right:
-      instrumentalRight
-  };
-
-}
-
-
-// ============================================================
-// Audio → MIDI
-// ============================================================
-
-async function audioToMidi(
-  basicPitch,
-  stereo,
-  onProgress
-) {
-
-  const audioBuffer =
-    await createBasicPitchAudioBuffer(
-      stereo
-    );
-
-
-  const frames = [];
-  const onsets = [];
-  const contours = [];
-
-
-  await basicPitch.evaluateModel(
-
-    audioBuffer,
-
-    (
-      frameBatch,
-      onsetBatch,
-      contourBatch
-    ) => {
-
-      frames.push(
-        ...frameBatch
-      );
-
-      onsets.push(
-        ...onsetBatch
-      );
-
-      contours.push(
-        ...contourBatch
-      );
-
-    },
-
-    progress => {
-
-      onProgress(
-        progress
-      );
-
-    }
-
-  );
-
-
-  let notes =
-    outputToNotesPoly(
-      frames,
-      onsets,
-      0.25,
-      0.25,
-      5
-    );
-
-
-  notes =
-    addPitchBendsToNoteEvents(
-      contours,
-      notes
-    );
-
-
-  let timedNotes =
-    noteFramesToTime(
-      notes
-    );
-
-
-  timedNotes =
-    normalizeNoteObjects(
-      timedNotes
-    );
-
-
-  timedNotes =
-    mergeSamePitchNotes(
-      timedNotes
-    );
-
-
-  timedNotes =
-    removeShortNotes(
-      timedNotes
-    );
-
-
-  timedNotes =
-    fillSmallGaps(
-      timedNotes
-    );
-
-
-  timedNotes.sort(
-    (
-      a,
-      b
-    ) =>
-      a.startTimeSeconds -
-      b.startTimeSeconds
-  );
-
-
-  const midi =
-    new Midi();
-
-
-  /*
-    MIDI tempoは120 BPM固定。
-
-    ノートのtime/durationは秒ベースで
-    Basic Pitchの実時間を維持する。
-  */
-
-  midi.header.setTempo(
-    MIDI_BPM
-  );
-
-
-  const track =
-    midi.addTrack();
-
-
-  for (
-    const note
-    of timedNotes
-  ) {
-
-    const pitch =
-      Math.round(
-        note.pitchMidi
-      );
-
-
-    const time =
-      Math.max(
-        0,
-        note.startTimeSeconds
-      );
-
-
-    const duration =
-      Math.max(
-        0.01,
-        note.durationSeconds
-      );
-
-
-    const velocity =
-      Math.max(
-        0.01,
-        Math.min(
-          1,
-          Number(
-            note.amplitude ?? 0.8
-          )
-        )
-      );
-
-
-    track.addNote({
-
-      midi:
-        pitch,
-
-      time:
-        time,
-
-      duration:
-        duration,
-
-      velocity:
-        velocity
-
-    });
-
-  }
-
-
-  return midi.toArray();
-
-}
-
-
-// ============================================================
-// Basic Pitch AudioBuffer
+// Basic Pitch用音声生成
 // ============================================================
 
 async function createBasicPitchAudioBuffer(
-  stereo
+  source
 ) {
 
   const sourceRate =
-    DEMUCS_SAMPLE_RATE;
-
+    source.sampleRate;
 
   const targetRate =
     BASIC_PITCH_SAMPLE_RATE;
 
 
-  const length =
-    stereo.left.length;
+  const sourceLength =
+    source.length;
 
+
+  // ----------------------------------------------------------
+  // ステレオ → モノラル
+  // ----------------------------------------------------------
 
   const mono =
     new Float32Array(
-      length
+      sourceLength
     );
 
 
-  /*
-    ステレオ → モノラル。
+  const channelCount =
+    source.numberOfChannels;
 
-    ここでは左右を平均する。
-  */
 
-  for (
-    let i = 0;
-    i < length;
-    i++
+  if (
+    channelCount === 1
   ) {
 
-    mono[i] =
-      (
-        stereo.left[i] +
-        stereo.right[i]
-      ) *
-      0.5;
+    mono.set(
+      source.getChannelData(0)
+    );
+
+  } else {
+
+    const left =
+      source.getChannelData(0);
+
+    const right =
+      source.getChannelData(
+        1
+      );
+
+
+    for (
+      let i = 0;
+      i < sourceLength;
+      i++
+    ) {
+
+      mono[i] =
+        (
+          left[i] +
+          right[i]
+        ) *
+        0.5;
+
+    }
 
   }
 
+
+  // ----------------------------------------------------------
+  // 元音声Buffer
+  // ----------------------------------------------------------
 
   const sourceBuffer =
     new AudioBuffer({
 
       length:
-        length,
+        sourceLength,
 
       numberOfChannels:
         1,
@@ -1543,6 +671,10 @@ async function createBasicPitchAudioBuffer(
     .getChannelData(0)
     .set(mono);
 
+
+  // ----------------------------------------------------------
+  // 22050Hzへリサンプリング
+  // ----------------------------------------------------------
 
   const targetLength =
     Math.max(
@@ -1562,20 +694,20 @@ async function createBasicPitchAudioBuffer(
     );
 
 
-  const source =
+  const node =
     offline.createBufferSource();
 
 
-  source.buffer =
+  node.buffer =
     sourceBuffer;
 
 
-  source.connect(
+  node.connect(
     offline.destination
   );
 
 
-  source.start(0);
+  node.start(0);
 
 
   const rendered =
@@ -1588,180 +720,99 @@ async function createBasicPitchAudioBuffer(
 
 
 // ============================================================
-// MIDI Note Normalization
+// ノート正規化
 // ============================================================
 
-function normalizeNoteObjects(
+function normalizeNotes(
   notes
 ) {
 
-  return notes.map(
-    note => {
+  return notes
 
-      const start =
-        Number(
-          note.startTimeSeconds ??
-          note.startTime ??
-          0
-        );
+    .map(
+      note => {
 
-
-      const duration =
-        Number(
-          note.durationSeconds ??
-          note.duration ??
-          0
-        );
+        const start =
+          Number(
+            note.startTimeSeconds ??
+            note.startTime ??
+            0
+          );
 
 
-      const pitch =
-        Number(
-          note.pitchMidi ??
-          note.pitch ??
-          0
-        );
+        const duration =
+          Number(
+            note.durationSeconds ??
+            note.duration ??
+            0
+          );
 
 
-      const amplitude =
-        Number(
-          note.amplitude ??
-          0.8
-        );
+        const pitch =
+          Number(
+            note.pitchMidi ??
+            note.pitch ??
+            0
+          );
 
 
-      return {
+        const amplitude =
+          Number(
+            note.amplitude ??
+            0.8
+          );
 
-        ...note,
 
-        startTimeSeconds:
-          start,
+        return {
 
-        durationSeconds:
-          duration,
+          ...note,
 
-        pitchMidi:
-          pitch,
+          startTimeSeconds:
+            start,
 
-        amplitude:
-          amplitude
+          durationSeconds:
+            duration,
 
-      };
+          pitchMidi:
+            pitch,
 
-    }
-  );
+          amplitude:
+            amplitude
+
+        };
+
+      }
+    )
+
+    .filter(
+      note =>
+        Number.isFinite(
+          note.startTimeSeconds
+        ) &&
+        Number.isFinite(
+          note.durationSeconds
+        ) &&
+        Number.isFinite(
+          note.pitchMidi
+        )
+    );
 
 }
 
 
 // ============================================================
-// 同音ノート結合
+// 低振幅ノート削除
 // ============================================================
 
-function mergeSamePitchNotes(
+function removeLowAmplitudeNotes(
   notes
 ) {
 
-  if (
-    notes.length <= 1
-  ) {
-
-    return notes;
-
-  }
-
-
-  const sorted =
-    [...notes].sort(
-      (
-        a,
-        b
-      ) =>
-        a.startTimeSeconds -
-        b.startTimeSeconds
-    );
-
-
-  const merged = [];
-
-
-  for (
-    const note
-    of sorted
-  ) {
-
-    const previous =
-      merged[
-        merged.length - 1
-      ];
-
-
-    if (!previous) {
-
-      merged.push({
-        ...note
-      });
-
-      continue;
-
-    }
-
-
-    const previousEnd =
-      previous.startTimeSeconds +
-      previous.durationSeconds;
-
-
-    const noteEnd =
-      note.startTimeSeconds +
-      note.durationSeconds;
-
-
-    const gap =
-      note.startTimeSeconds -
-      previousEnd;
-
-
-    const samePitch =
-      Math.round(
-        previous.pitchMidi
-      ) ===
-      Math.round(
-        note.pitchMidi
-      );
-
-
-    if (
-      samePitch &&
-      gap >= -0.03 &&
-      gap <= MERGE_GAP
-    ) {
-
-      previous.durationSeconds =
-        Math.max(
-          previousEnd,
-          noteEnd
-        ) -
-        previous.startTimeSeconds;
-
-
-      previous.amplitude =
-        Math.max(
-          previous.amplitude ?? 0,
-          note.amplitude ?? 0
-        );
-
-    } else {
-
-      merged.push({
-        ...note
-      });
-
-    }
-
-  }
-
-
-  return merged;
+  return notes.filter(
+    note =>
+      note.amplitude >=
+      MIN_AMPLITUDE
+  );
 
 }
 
@@ -1784,7 +835,135 @@ function removeShortNotes(
 
 
 // ============================================================
-// 小さい隙間を埋める
+// 同一音程のノート統合
+// ============================================================
+
+function mergeSamePitchNotes(
+  notes
+) {
+
+  const sorted =
+    [...notes].sort(
+      (
+        a,
+        b
+      ) => {
+
+        if (
+          a.pitchMidi !==
+          b.pitchMidi
+        ) {
+
+          return (
+            a.pitchMidi -
+            b.pitchMidi
+          );
+
+        }
+
+        return (
+          a.startTimeSeconds -
+          b.startTimeSeconds
+        );
+
+      }
+    );
+
+
+  const result = [];
+
+
+  for (
+    const note
+    of sorted
+  ) {
+
+    const previous =
+      result[
+        result.length - 1
+      ];
+
+
+    if (!previous) {
+
+      result.push({
+        ...note
+      });
+
+      continue;
+
+    }
+
+
+    const samePitch =
+      Math.round(
+        previous.pitchMidi
+      ) ===
+      Math.round(
+        note.pitchMidi
+      );
+
+
+    const previousEnd =
+      previous.startTimeSeconds +
+      previous.durationSeconds;
+
+
+    const gap =
+      note.startTimeSeconds -
+      previousEnd;
+
+
+    if (
+      samePitch &&
+      gap <= MERGE_GAP &&
+      gap >= -OVERLAP_TOLERANCE
+    ) {
+
+      const noteEnd =
+        note.startTimeSeconds +
+        note.durationSeconds;
+
+
+      previous.durationSeconds =
+        Math.max(
+          previousEnd,
+          noteEnd
+        ) -
+        previous.startTimeSeconds;
+
+
+      previous.amplitude =
+        Math.max(
+          previous.amplitude,
+          note.amplitude
+        );
+
+    } else {
+
+      result.push({
+        ...note
+      });
+
+    }
+
+  }
+
+
+  return result.sort(
+    (
+      a,
+      b
+    ) =>
+      a.startTimeSeconds -
+      b.startTimeSeconds
+  );
+
+}
+
+
+// ============================================================
+// 小さな隙間を埋める
 // ============================================================
 
 function fillSmallGaps(
@@ -1841,7 +1020,7 @@ function fillSmallGaps(
 
     if (
       gap > 0 &&
-      gap <= MAX_FILL_GAP
+      gap <= FILL_GAP
     ) {
 
       current.durationSeconds +=
@@ -1858,48 +1037,236 @@ function fillSmallGaps(
 
 
 // ============================================================
-// Demucs Transition Window
+// 重複する同音ノートを整理
 // ============================================================
 
-function makeTransitionWindow(
-  segment,
-  overlap
+function removeOverlappingSamePitchNotes(
+  notes
 ) {
 
-  const window =
-    new Float32Array(
-      segment
+  const sorted =
+    [...notes].sort(
+      (
+        a,
+        b
+      ) =>
+        a.startTimeSeconds -
+        b.startTimeSeconds
     );
 
 
-  window.fill(1);
+  const result = [];
 
 
   for (
-    let i = 0;
-    i < overlap;
-    i++
+    const note
+    of sorted
   ) {
 
-    const value =
-      i /
-      overlap;
+    let absorbed =
+      false;
 
 
-    window[i] =
-      value;
+    for (
+      const previous
+      of result
+    ) {
+
+      if (
+        Math.round(
+          previous.pitchMidi
+        ) !==
+        Math.round(
+          note.pitchMidi
+        )
+      ) {
+
+        continue;
+
+      }
 
 
-    window[
-      segment -
-      1 -
-      i
-    ] =
-      value;
+      const previousEnd =
+        previous.startTimeSeconds +
+        previous.durationSeconds;
+
+
+      const noteEnd =
+        note.startTimeSeconds +
+        note.durationSeconds;
+
+
+      const overlap =
+        previousEnd -
+        note.startTimeSeconds;
+
+
+      if (
+        overlap >= 0 &&
+        overlap <=
+          OVERLAP_TOLERANCE
+      ) {
+
+        previous.durationSeconds =
+          Math.max(
+            previousEnd,
+            noteEnd
+          ) -
+          previous.startTimeSeconds;
+
+
+        previous.amplitude =
+          Math.max(
+            previous.amplitude,
+            note.amplitude
+          );
+
+
+        absorbed = true;
+
+        break;
+
+      }
+
+    }
+
+
+    if (!absorbed) {
+
+      result.push({
+        ...note
+      });
+
+    }
 
   }
 
 
-  return window;
+  return result;
+
+}
+
+
+// ============================================================
+// 最終クリーンアップ
+// ============================================================
+
+function finalCleanUp(
+  notes
+) {
+
+  return notes
+
+    .filter(
+      note =>
+        note.durationSeconds >=
+        MIN_NOTE_DURATION
+    )
+
+    .map(
+      note => ({
+
+        ...note,
+
+        pitchMidi:
+          Math.max(
+            0,
+            Math.min(
+              127,
+              Math.round(
+                note.pitchMidi
+              )
+            )
+          ),
+
+        startTimeSeconds:
+          Math.max(
+            0,
+            note.startTimeSeconds
+          ),
+
+        durationSeconds:
+          Math.max(
+            0.01,
+            note.durationSeconds
+          ),
+
+        amplitude:
+          Math.max(
+            0.01,
+            Math.min(
+              1,
+              note.amplitude
+            )
+          )
+
+      })
+    )
+
+    .sort(
+      (
+        a,
+        b
+      ) =>
+        a.startTimeSeconds -
+        b.startTimeSeconds
+    );
+
+}
+
+
+// ============================================================
+// MIDI生成
+// ============================================================
+
+function createMidi(
+  notes
+) {
+
+  const midi =
+    new Midi();
+
+
+  /*
+    120 BPMを基準にする。
+
+    note.time / durationは
+    秒としてTone.js MIDIへ渡す。
+  */
+
+  midi.header.setTempo(
+    MIDI_BPM
+  );
+
+
+  const track =
+    midi.addTrack();
+
+
+  for (
+    const note
+    of notes
+  ) {
+
+    track.addNote({
+
+      midi:
+        note.pitchMidi,
+
+      time:
+        note.startTimeSeconds,
+
+      duration:
+        note.durationSeconds,
+
+      velocity:
+        note.amplitude
+
+    });
+
+  }
+
+
+  return midi;
 
 }
