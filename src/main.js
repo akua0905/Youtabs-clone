@@ -10,52 +10,24 @@ import JSZip from "jszip";
 
 
 // ============================================================
-// Model
+// 設定
 // ============================================================
 
-const MDX_MODEL =
-  "https://huggingface.co/masszhou/mdxnet/resolve/main/UVR-MDX-NET-Inst_HQ_3.onnx";
+const DEMUCS_MODEL =
+  "https://huggingface.co/StemSplitio/htdemucs-ft-vocals-onnx/resolve/main/htdemucs_ft_vocals_fp16weights.onnx";
 
 const BASIC_PITCH_MODEL =
   "https://cdn.jsdelivr.net/npm/@spotify/basic-pitch@1.0.1/model/model.json";
 
-
-// ============================================================
-// MDX-Net configuration
-// ============================================================
-
-const SAMPLE_RATE = 44100;
-
-const N_FFT = 6144;
-const HOP = 1024;
-
-const DIM_F = 3072;
-const DIM_T = 8;
-
-const CHUNK_SIZE =
-  HOP * (DIM_T - 1);
-
-const TRIM =
-  N_FFT / 2;
-
-const GEN_SIZE =
-  CHUNK_SIZE - 2 * TRIM;
-
-const OVERLAP = 2;
-
-const COMPENSATION = 1.022;
-
-
-// ============================================================
-// Basic Pitch
-// ============================================================
-
+const DEMUCS_SAMPLE_RATE = 44100;
 const BASIC_PITCH_SAMPLE_RATE = 22050;
 
+const DEMUCS_SAMPLES = 343980;
+const DEMUCS_OVERLAP = Math.floor(DEMUCS_SAMPLES / 4);
+const DEMUCS_STRIDE =
+  DEMUCS_SAMPLES - DEMUCS_OVERLAP;
 
-// ============================================================
-// MIDI
-// ============================================================
+const VOCALS_STEM_ROW = 3;
 
 const MIDI_BPM = 120;
 
@@ -85,7 +57,7 @@ const progressBar =
 
 
 // ============================================================
-// State
+// 状態
 // ============================================================
 
 let selectedFile = null;
@@ -96,13 +68,19 @@ let selectedFile = null;
 // ============================================================
 
 function setStatus(message) {
+
   if (statusElement) {
     statusElement.textContent = message;
   }
+
 }
 
 
 function setProgress(value) {
+
+  if (!progressBar) {
+    return;
+  }
 
   const percent =
     Math.max(
@@ -113,10 +91,9 @@ function setProgress(value) {
       )
     );
 
-  if (progressBar) {
-    progressBar.style.width =
-      `${percent}%`;
-  }
+  progressBar.style.width =
+    `${percent}%`;
+
 }
 
 
@@ -130,457 +107,430 @@ function waitForBrowser() {
       );
     }
   );
+
 }
 
 
 // ============================================================
-// File
+// ファイル選択
 // ============================================================
 
-if (audioInput) {
+audioInput.addEventListener(
+  "change",
+  () => {
 
-  audioInput.addEventListener(
-    "change",
-    () => {
+    selectedFile =
+      audioInput.files?.[0] ?? null;
 
-      selectedFile =
-        audioInput.files?.[0] ?? null;
+    if (downloadElement) {
+      downloadElement.style.display =
+        "none";
+    }
 
-      if (downloadElement) {
-        downloadElement.style.display =
-          "none";
-      }
+    setProgress(0);
 
-      setProgress(0);
-
-      if (!selectedFile) {
-
-        setStatus(
-          "音源を選択してください。"
-        );
-
-        return;
-      }
+    if (!selectedFile) {
 
       setStatus(
-        `選択済み\n${selectedFile.name}`
+        "音源を選択してください。"
       );
 
+      return;
     }
-  );
 
-}
+    setStatus(
+      `選択済み\n${selectedFile.name}`
+    );
+
+  }
+);
 
 
 // ============================================================
-// Main
+// メイン処理
 // ============================================================
 
-if (convertButton) {
+convertButton.addEventListener(
+  "click",
+  async () => {
 
-  convertButton.addEventListener(
-    "click",
-    async () => {
+    if (!selectedFile) {
 
-      if (!selectedFile) {
+      setStatus(
+        "先に音源を選択してください。"
+      );
 
-        setStatus(
-          "先に音源を選択してください。"
+      return;
+    }
+
+
+    convertButton.disabled = true;
+
+    if (downloadElement) {
+      downloadElement.style.display =
+        "none";
+    }
+
+
+    let demucsSession = null;
+
+
+    try {
+
+      // ======================================================
+      // 1. 音源読み込み
+      // ======================================================
+
+      setStatus(
+        "音源を読み込んでいます……"
+      );
+
+      setProgress(0.01);
+
+
+      const fileBuffer =
+        await selectedFile.arrayBuffer();
+
+
+      const decodedAudio =
+        await decodeAudio(
+          fileBuffer
         );
 
-        return;
+
+      if (
+        !decodedAudio ||
+        decodedAudio.length <= 0
+      ) {
+
+        throw new Error(
+          "音源を正常に読み込めませんでした。"
+        );
+
       }
 
 
-      convertButton.disabled =
-        true;
+      // ======================================================
+      // 2. 44.1kHz Stereo
+      // ======================================================
+
+      setStatus(
+        "音源を44.1kHzステレオに変換しています……"
+      );
+
+      setProgress(0.04);
 
 
-      if (downloadElement) {
-        downloadElement.style.display =
-          "none";
-      }
+      const demucsAudio =
+        await convertToStereo44100(
+          decodedAudio
+        );
 
 
-      let session = null;
+      const originalLeft =
+        demucsAudio.left;
 
+      const originalRight =
+        demucsAudio.right;
+
+
+      // ======================================================
+      // 3. Demucs読み込み
+      // ======================================================
+
+      setStatus(
+        "音源分離AIを読み込んでいます……\n" +
+        "初回はモデルの読み込みに時間がかかります。"
+      );
+
+      setProgress(0.06);
+
+
+      demucsSession =
+        await createDemucsSession();
+
+
+      // ======================================================
+      // 4. Demucsモデル仕様確認
+      // ======================================================
+
+      validateDemucsModel(
+        demucsSession
+      );
+
+
+      // ======================================================
+      // 5. ボーカル抽出
+      // ======================================================
+
+      setStatus(
+        "ボーカル／伴奏を分離しています……"
+      );
+
+      setProgress(0.08);
+
+
+      const vocals =
+        await extractVocals(
+          demucsSession,
+          originalLeft,
+          originalRight,
+          progress => {
+
+            setProgress(
+              0.08 +
+              progress * 0.47
+            );
+
+            setStatus(
+              "ボーカル／伴奏を分離しています……\n" +
+              `${Math.round(progress * 100)}%`
+            );
+
+          }
+        );
+
+
+      // ======================================================
+      // 6. 伴奏生成
+      // ======================================================
+
+      setStatus(
+        "伴奏トラックを生成しています……"
+      );
+
+      setProgress(0.57);
+
+
+      const instrumental =
+        subtractVocals(
+          originalLeft,
+          originalRight,
+          vocals.left,
+          vocals.right
+        );
+
+
+      // ======================================================
+      // 7. Demucs解放
+      // ======================================================
 
       try {
 
-        // ------------------------------------------------------
-        // 1. WebGPU
-        // ------------------------------------------------------
-
-        setStatus(
-          "WebGPUを確認しています……"
-        );
-
-        setProgress(0.01);
-
-
         if (
-          !("gpu" in navigator)
+          demucsSession &&
+          typeof demucsSession.release ===
+            "function"
         ) {
 
-          throw new Error(
-            "このブラウザではWebGPUを利用できません。\n\n" +
-            "iPhone SafariではWebGPU対応版のSafariを使用してください。"
-          );
+          await demucsSession.release();
 
         }
 
+      } catch {}
 
-        const adapter =
-          await navigator.gpu.requestAdapter();
-
-
-        if (!adapter) {
-
-          throw new Error(
-            "WebGPUアダプターを取得できませんでした。"
-          );
-
-        }
+      demucsSession = null;
 
 
-        await waitForBrowser();
+      await waitForBrowser();
 
 
-        // ------------------------------------------------------
-        // 2. Decode
-        // ------------------------------------------------------
+      // ======================================================
+      // 8. Basic Pitch
+      // ======================================================
 
-        setStatus(
-          "音源を読み込んでいます……"
+      setStatus(
+        "Basic Pitchを準備しています……"
+      );
+
+      setProgress(0.60);
+
+
+      const basicPitch =
+        new BasicPitch(
+          BASIC_PITCH_MODEL
         );
 
-        setProgress(0.03);
+
+      // ======================================================
+      // 9. ボーカル → MIDI
+      // ======================================================
+
+      setStatus(
+        "ボーカルをMIDIに変換しています……"
+      );
+
+      setProgress(0.62);
 
 
-        const fileBuffer =
-          await selectedFile.arrayBuffer();
+      const vocalsMidi =
+        await audioToMidi(
+          basicPitch,
+          vocals,
+          progress => {
 
-
-        const decoded =
-          await decodeAudio(
-            fileBuffer
-          );
-
-
-        await waitForBrowser();
-
-
-        // ------------------------------------------------------
-        // 3. Stereo 44.1kHz
-        // ------------------------------------------------------
-
-        setStatus(
-          "音源を44.1kHzステレオに変換しています……"
-        );
-
-        setProgress(0.06);
-
-
-        const stereo =
-          await convertToStereo44100(
-            decoded
-          );
-
-
-        const originalLeft =
-          stereo.left;
-
-        const originalRight =
-          stereo.right;
-
-
-        // decoded AudioBufferを解放しやすくする
-        decoded.getChannelData(0).fill(0);
-
-
-        await waitForBrowser();
-
-
-        // ------------------------------------------------------
-        // 4. MDX session
-        // ------------------------------------------------------
-
-        setStatus(
-          "音源分離AIを読み込んでいます……\n" +
-          "初回は約67MBのモデルを読み込みます。"
-        );
-
-        setProgress(0.08);
-
-
-        session =
-          await createMDXSession();
-
-
-        await waitForBrowser();
-
-
-        // ------------------------------------------------------
-        // 5. Separation
-        // ------------------------------------------------------
-
-        setStatus(
-          "ボーカル／伴奏を分離しています……"
-        );
-
-        setProgress(0.10);
-
-
-        const separated =
-          await separateWithMDX(
-            session,
-            originalLeft,
-            originalRight,
-            progress => {
-
-              setProgress(
-                0.10 +
-                progress * 0.47
-              );
-
-              setStatus(
-                "ボーカル／伴奏を分離しています……\n" +
-                `${Math.round(progress * 100)}%`
-              );
-
-            }
-          );
-
-
-        const vocals =
-          separated.vocals;
-
-        const instrumental =
-          separated.instrumental;
-
-
-        // ------------------------------------------------------
-        // 6. Release MDX
-        // ------------------------------------------------------
-
-        try {
-
-          if (
-            session &&
-            typeof session.release ===
-              "function"
-          ) {
-
-            await session.release();
+            setProgress(
+              0.62 +
+              progress * 0.16
+            );
 
           }
-
-        } catch {}
-
-        session = null;
-
-
-        await waitForBrowser();
-
-
-        // ------------------------------------------------------
-        // 7. Basic Pitch
-        // ------------------------------------------------------
-
-        setStatus(
-          "Basic Pitchを準備しています……"
-        );
-
-        setProgress(0.59);
-
-
-        const basicPitch =
-          new BasicPitch(
-            BASIC_PITCH_MODEL
-          );
-
-
-        await waitForBrowser();
-
-
-        // ------------------------------------------------------
-        // 8. Vocals MIDI
-        // ------------------------------------------------------
-
-        setStatus(
-          "ボーカルをMIDIに変換しています……"
-        );
-
-        setProgress(0.61);
-
-
-        const vocalsMidi =
-          await audioToMidi(
-            basicPitch,
-            vocals,
-            progress => {
-
-              setProgress(
-                0.61 +
-                progress * 0.17
-              );
-
-            }
-          );
-
-
-        await waitForBrowser();
-
-
-        // ------------------------------------------------------
-        // 9. Instrumental MIDI
-        // ------------------------------------------------------
-
-        setStatus(
-          "伴奏をMIDIに変換しています……"
-        );
-
-        setProgress(0.79);
-
-
-        const instrumentalMidi =
-          await audioToMidi(
-            basicPitch,
-            instrumental,
-            progress => {
-
-              setProgress(
-                0.79 +
-                progress * 0.15
-              );
-
-            }
-          );
-
-
-        await waitForBrowser();
-
-
-        // ------------------------------------------------------
-        // 10. ZIP
-        // ------------------------------------------------------
-
-        setStatus(
-          "ZIPファイルを生成しています……"
-        );
-
-        setProgress(0.96);
-
-
-        const zip =
-          new JSZip();
-
-
-        zip.file(
-          "vocals.mid",
-          vocalsMidi
         );
 
 
-        zip.file(
-          "instrumental.mid",
-          instrumentalMidi
+      await waitForBrowser();
+
+
+      // ======================================================
+      // 10. 伴奏 → MIDI
+      // ======================================================
+
+      setStatus(
+        "伴奏をMIDIに変換しています……"
+      );
+
+      setProgress(0.79);
+
+
+      const instrumentalMidi =
+        await audioToMidi(
+          basicPitch,
+          instrumental,
+          progress => {
+
+            setProgress(
+              0.79 +
+              progress * 0.16
+            );
+
+          }
         );
 
 
-        const zipBlob =
-          await zip.generateAsync({
-            type: "blob",
-            compression: "DEFLATE"
-          });
+      await waitForBrowser();
 
 
-        const url =
-          URL.createObjectURL(
-            zipBlob
-          );
+      // ======================================================
+      // 11. ZIP
+      // ======================================================
+
+      setStatus(
+        "ZIPファイルを生成しています……"
+      );
+
+      setProgress(0.96);
 
 
-        const baseName =
-          selectedFile.name.replace(
+      const zip =
+        new JSZip();
+
+
+      zip.file(
+        "vocals.mid",
+        vocalsMidi
+      );
+
+
+      zip.file(
+        "instrumental.mid",
+        instrumentalMidi
+      );
+
+
+      const zipBlob =
+        await zip.generateAsync({
+          type: "blob",
+          compression: "DEFLATE"
+        });
+
+
+      const url =
+        URL.createObjectURL(
+          zipBlob
+        );
+
+
+      const baseName =
+        selectedFile.name
+          .replace(
             /\.[^/.]+$/,
             ""
           );
 
 
-        downloadElement.href =
-          url;
+      downloadElement.href =
+        url;
 
-        downloadElement.download =
-          `${baseName}_採譜.zip`;
+      downloadElement.download =
+        `${baseName}_採譜.zip`;
 
-        downloadElement.textContent =
-          "ZIPを保存";
+      downloadElement.textContent =
+        "ZIPを保存";
 
-        downloadElement.style.display =
-          "block";
-
-
-        setProgress(1);
+      downloadElement.style.display =
+        "block";
 
 
-        setStatus(
-          "解析完了\n\n" +
-          "vocals.mid\n" +
-          "instrumental.mid\n\n" +
-          "ZIPにまとめました。"
-        );
-
-      } catch (error) {
-
-        console.error(
-          error
-        );
+      setProgress(1);
 
 
-        const message =
-          error instanceof Error
-            ? `${error.name}: ${error.message}`
-            : String(error);
+      setStatus(
+        "解析完了\n\n" +
+        "vocals.mid\n" +
+        "instrumental.mid\n\n" +
+        "ZIPにまとめました。"
+      );
 
 
-        setStatus(
-          "エラーが発生しました。\n\n" +
-          message
-        );
+    } catch (error) {
+
+      console.error(
+        "YouTabs Clone Error:",
+        error
+      );
 
 
-        setProgress(0);
-
-      } finally {
-
-        if (session) {
-
-          try {
-
-            if (
-              typeof session.release ===
-                "function"
-            ) {
-
-              await session.release();
-
-            }
-
-          } catch {}
-
-        }
+      const message =
+        error instanceof Error
+          ? `${error.name}: ${error.message}`
+          : String(error);
 
 
-        convertButton.disabled =
-          false;
+      setStatus(
+        "エラーが発生しました。\n\n" +
+        message
+      );
+
+
+      setProgress(0);
+
+
+    } finally {
+
+      if (demucsSession) {
+
+        try {
+
+          if (
+            typeof demucsSession.release ===
+              "function"
+          ) {
+
+            await demucsSession.release();
+
+          }
+
+        } catch {}
 
       }
 
-    }
-  );
+      convertButton.disabled =
+        false;
 
-}
+    }
+
+  }
+);
 
 
 // ============================================================
@@ -604,7 +554,9 @@ async function decodeAudio(
   } finally {
 
     try {
+
       await context.close();
+
     } catch {}
 
   }
@@ -613,17 +565,24 @@ async function decodeAudio(
 
 
 // ============================================================
-// Convert to 44.1kHz Stereo
+// 44.1kHz Stereo
 // ============================================================
 
 async function convertToStereo44100(
   source
 ) {
 
+  const targetRate =
+    DEMUCS_SAMPLE_RATE;
+
+
   const targetLength =
-    Math.ceil(
-      source.duration *
-      SAMPLE_RATE
+    Math.max(
+      1,
+      Math.ceil(
+        source.duration *
+        targetRate
+      )
     );
 
 
@@ -631,7 +590,7 @@ async function convertToStereo44100(
     new OfflineAudioContext(
       2,
       targetLength,
-      SAMPLE_RATE
+      targetRate
     );
 
 
@@ -690,39 +649,45 @@ async function convertToStereo44100(
 
 
 // ============================================================
-// MDX Session
+// Demucs Session
 // ============================================================
 
-async function createMDXSession() {
+async function createDemucsSession() {
 
-  ort.env.wasm.simd =
-    true;
+  ort.env.wasm.simd = true;
 
-  ort.env.wasm.numThreads =
-    1;
+  ort.env.wasm.numThreads = 1;
 
-  ort.env.wasm.proxy =
-    false;
+  ort.env.wasm.proxy = false;
 
 
-  if (
-    ort.env.webgpu
-  ) {
+  const providers =
+    ["wasm"];
 
-    ort.env.webgpu.powerPreference =
-      "low-power";
 
-  }
+  console.log(
+    "ONNX Runtime:",
+    ort.env
+  );
+
+
+  console.log(
+    "Demucs model:",
+    DEMUCS_MODEL
+  );
+
+
+  console.log(
+    "Creating Demucs session..."
+  );
 
 
   const session =
     await ort.InferenceSession.create(
-      MDX_MODEL,
+      DEMUCS_MODEL,
       {
-
-        executionProviders: [
-          "webgpu"
-        ],
+        executionProviders:
+          providers,
 
         graphOptimizationLevel:
           "basic",
@@ -732,20 +697,31 @@ async function createMDXSession() {
 
         enableMemPattern:
           false
-
       }
     );
 
 
   console.log(
-    "MDX inputs:",
+    "Demucs input names:",
     session.inputNames
   );
 
 
   console.log(
-    "MDX outputs:",
+    "Demucs input metadata:",
+    session.inputMetadata
+  );
+
+
+  console.log(
+    "Demucs output names:",
     session.outputNames
+  );
+
+
+  console.log(
+    "Demucs output metadata:",
+    session.outputMetadata
   );
 
 
@@ -755,45 +731,173 @@ async function createMDXSession() {
 
 
 // ============================================================
-// MDX Separation
+// Demucsモデル仕様確認
 // ============================================================
 
-async function separateWithMDX(
-
-  session,
-
-  originalLeft,
-
-  originalRight,
-
-  onProgress
-
+function validateDemucsModel(
+  session
 ) {
 
-  const total =
-    originalLeft.length;
+  if (
+    !session.inputNames ||
+    session.inputNames.length === 0
+  ) {
+
+    throw new Error(
+      "Demucsモデルに入力が存在しません。"
+    );
+
+  }
+
+
+  const inputName =
+    session.inputNames[0];
+
+
+  const metadata =
+    session.inputMetadata?.[inputName];
+
+
+  console.log(
+    "Actual Demucs input:",
+    inputName,
+    metadata
+  );
 
 
   /*
-   * UVR MDX-Net:
-   *
-   * dim_f = 3072
-   * dim_t = 8
-   * n_fft = 6144
-   * hop = 1024
-   *
-   * chunk_size =
-   * 1024 * (8 - 1)
-   * = 7168 samples
-   */
+    正しいモデル:
+
+    name:
+      mix
+
+    dimensions:
+      [1, 2, 343980]
+
+    dtype:
+      float32
+  */
 
 
-  const outputLeft =
+  if (
+    inputName !== "mix"
+  ) {
+
+    throw new Error(
+      "読み込んだDemucsモデルの入力名が想定と異なります。\n\n" +
+      `実際: ${inputName}\n` +
+      "期待: mix\n\n" +
+      "モデルURLまたはモデルファイルが正しくありません。"
+    );
+
+  }
+
+
+  const dimensions =
+    metadata?.dimensions;
+
+
+  if (
+    !dimensions ||
+    dimensions.length !== 3
+  ) {
+
+    throw new Error(
+      "Demucsモデルの入力次元数が異なります。\n\n" +
+      `実際: ${JSON.stringify(dimensions)}\n` +
+      "期待: [1, 2, 343980]\n\n" +
+      "別のONNXモデルを読み込んでいる可能性があります。"
+    );
+
+  }
+
+
+  const expected =
+    [
+      1,
+      2,
+      DEMUCS_SAMPLES
+    ];
+
+
+  for (
+    let i = 0;
+    i < expected.length;
+    i++
+  ) {
+
+    const actual =
+      dimensions[i];
+
+
+    /*
+      ONNX Runtimeでは
+      dynamic dimensionが
+      null / undefined / -1
+      になる場合があるため、
+      その場合は固定値チェックを
+      スキップする。
+    */
+
+    if (
+      actual === null ||
+      actual === undefined ||
+      actual === -1 ||
+      actual === "?"
+    ) {
+
+      continue;
+
+    }
+
+
+    if (
+      Number(actual) !==
+      expected[i]
+    ) {
+
+      throw new Error(
+        "Demucsモデルの入力形状が想定と違います。\n\n" +
+        `実際: ${JSON.stringify(dimensions)}\n` +
+        `期待: ${JSON.stringify(expected)}\n\n` +
+        "現在のモデルURLが正しいHT-Demucsモデルを指しているか確認してください。"
+      );
+
+    }
+
+  }
+
+
+  console.log(
+    "Demucs model shape OK:",
+    dimensions
+  );
+
+}
+
+
+// ============================================================
+// Vocal Extraction
+// ============================================================
+
+async function extractVocals(
+  session,
+  left,
+  right,
+  onProgress
+) {
+
+  const total =
+    left.length;
+
+
+  const vocalsLeft =
     new Float32Array(
       total
     );
 
-  const outputRight =
+
+  const vocalsRight =
     new Float32Array(
       total
     );
@@ -805,72 +909,40 @@ async function separateWithMDX(
     );
 
 
-  const hopSize =
-    Math.floor(
-      CHUNK_SIZE /
-      OVERLAP
+  const window =
+    makeTransitionWindow(
+      DEMUCS_SAMPLES,
+      DEMUCS_OVERLAP
     );
 
 
-  const genSize =
-    GEN_SIZE;
-
-
-  const paddedLength =
-    total +
-    2 * TRIM;
-
-
-  const padRemainder =
-    (
-      genSize -
-      (
-        paddedLength -
-        CHUNK_SIZE
-      ) %
-      genSize
-    ) %
-    genSize;
-
-
-  const finalLength =
-    paddedLength +
-    padRemainder;
-
-
-  const paddedLeft =
+  const chunkBuffer =
     new Float32Array(
-      finalLength
+      2 *
+      DEMUCS_SAMPLES
     );
-
-  const paddedRight =
-    new Float32Array(
-      finalLength
-    );
-
-
-  paddedLeft.set(
-    originalLeft,
-    TRIM
-  );
-
-  paddedRight.set(
-    originalRight,
-    TRIM
-  );
 
 
   const chunkCount =
     Math.max(
       1,
       Math.ceil(
-        (
-          finalLength -
-          CHUNK_SIZE
-        ) /
-        hopSize
-      ) + 1
+        total /
+        DEMUCS_STRIDE
+      )
     );
+
+
+  const inputName =
+    session.inputNames[0];
+
+
+  const outputName =
+    session.outputNames.includes(
+      "stems"
+    )
+      ? "stems"
+      : session.outputNames[0];
 
 
   for (
@@ -879,117 +951,117 @@ async function separateWithMDX(
     chunkIndex++
   ) {
 
-    const sourceStart =
+    const start =
       chunkIndex *
-      hopSize;
+      DEMUCS_STRIDE;
 
 
-    const chunkLeft =
-      new Float32Array(
-        CHUNK_SIZE
-      );
-
-    const chunkRight =
-      new Float32Array(
-        CHUNK_SIZE
-      );
-
-
-    const available =
+    const end =
       Math.min(
-        CHUNK_SIZE,
-        finalLength -
-        sourceStart
+        start +
+        DEMUCS_SAMPLES,
+        total
       );
 
 
-    if (
-      available > 0
-    ) {
+    const chunkLength =
+      end -
+      start;
 
-      chunkLeft.set(
-        paddedLeft.subarray(
-          sourceStart,
-          sourceStart +
-          available
+
+    chunkBuffer.fill(0);
+
+
+    chunkBuffer
+      .subarray(
+        0,
+        chunkLength
+      )
+      .set(
+        left.subarray(
+          start,
+          end
         )
       );
 
 
-      chunkRight.set(
-        paddedRight.subarray(
-          sourceStart,
-          sourceStart +
-          available
+    chunkBuffer
+      .subarray(
+        DEMUCS_SAMPLES,
+        DEMUCS_SAMPLES +
+        chunkLength
+      )
+      .set(
+        right.subarray(
+          start,
+          end
         )
       );
-
-    }
-
-
-    setStatus(
-      "音源分離AIを実行しています……\n" +
-      `チャンク ${chunkIndex + 1}/${chunkCount}`
-    );
-
-
-    await waitForBrowser();
-
-
-    // --------------------------------------------------------
-    // STFT
-    // --------------------------------------------------------
-
-    const spectrum =
-      createMDXSpectrum(
-        chunkLeft,
-        chunkRight
-      );
-
-
-    await waitForBrowser();
-
-
-    const inputName =
-      session.inputNames[0];
-
-
-    const outputName =
-      session.outputNames[0];
 
 
     /*
-     * IMPORTANT:
-     *
-     * [1, 4, 3072, 8]
-     *
-     * 前のコードの [1,4,3072,256] は誤り。
-     */
+      ここが重要。
 
-    const tensor =
+      HT-Demucs FT vocals ONNX:
+
+      [1, 2, 343980]
+
+      44.1kHz stereo
+    */
+
+    const inputTensor =
       new ort.Tensor(
         "float32",
-        spectrum,
+        chunkBuffer,
         [
           1,
-          4,
-          DIM_F,
-          DIM_T
+          2,
+          DEMUCS_SAMPLES
         ]
       );
 
 
-    // spectrumへの参照を保持するのはtensorだけ
-    // 推論後にまとめて解放する。
+    /*
+      実行前にshapeを確認。
+    */
+
+    console.log(
+      "Running Demucs:",
+      {
+        inputName,
+        shape:
+          inputTensor.dims,
+        length:
+          inputTensor.data.length
+      }
+    );
 
 
-    const result =
-      await session.run(
-        {
+    let result;
+
+
+    try {
+
+      result =
+        await session.run({
           [inputName]:
-            tensor
-        }
+            inputTensor
+        });
+
+    } catch (error) {
+
+      throw new Error(
+        "Demucsの推論に失敗しました。\n\n" +
+        (
+          error instanceof Error
+            ? error.message
+            : String(error)
+        ) +
+        "\n\n" +
+        "入力shape: [1, 2, 343980]"
       );
+
+    }
 
 
     const output =
@@ -999,152 +1071,107 @@ async function separateWithMDX(
     if (!output) {
 
       throw new Error(
-        "MDX-Netの出力が見つかりません。\n" +
+        "Demucsの出力が見つかりません。\n\n" +
         `出力名: ${session.outputNames.join(", ")}`
       );
 
     }
 
 
-    const outputData =
+    console.log(
+      "Demucs output:",
+      output.dims
+    );
+
+
+    /*
+      正しい出力:
+
+      [1, 4, 2, 343980]
+    */
+
+    if (
+      !output.dims ||
+      output.dims.length !== 4
+    ) {
+
+      throw new Error(
+        "Demucsの出力shapeが想定と違います。\n\n" +
+        `実際: ${JSON.stringify(output.dims)}\n` +
+        "期待: [1, 4, 2, 343980]"
+      );
+
+    }
+
+
+    const data =
       output.data;
 
 
-    const stem =
-      mdxSpectrumToAudio(
-        outputData
-      );
+    const channels =
+      2;
 
 
-    // --------------------------------------------------------
-    // Overlap Add
-    // --------------------------------------------------------
-
-    const blend =
-      createBlendWindow(
-        CHUNK_SIZE,
-        hopSize
-      );
+    const samples =
+      DEMUCS_SAMPLES;
 
 
-    /*
-     * モデル出力の中央部分だけ使用する。
-     *
-     * MDX-NetのSTFTはcenter=True相当なので、
-     * 左右TRIMを捨てる。
-     */
+    const stemCount =
+      4;
 
-    const generatedLength =
-      Math.min(
-        GEN_SIZE,
-        stem.left.length -
-        2 * TRIM
-      );
+
+    const rowOffset =
+      VOCALS_STEM_ROW *
+      channels *
+      samples;
 
 
     for (
-      let i = 0;
-      i < generatedLength;
-      i++
+      let s = 0;
+      s < chunkLength;
+      s++
     ) {
 
-      const sourceIndex =
-        i +
-        TRIM;
-
-
-      const destinationIndex =
-        sourceStart +
-        i +
-        TRIM;
-
-
-      if (
-        destinationIndex >=
-        finalLength
-      ) {
-
-        break;
-
-      }
-
-
       const w =
-        blend[
-          i %
-          blend.length
+        window[s];
+
+
+      const vocalLeft =
+        data[
+          rowOffset +
+          s
         ];
 
 
-      outputLeft[
-        Math.max(
-          0,
-          destinationIndex -
-          TRIM
-        )
+      const vocalRight =
+        data[
+          rowOffset +
+          samples +
+          s
+        ];
+
+
+      vocalsLeft[
+        start + s
       ] +=
-        stem.left[
-          sourceIndex
-        ] *
-        COMPENSATION *
+        vocalLeft *
         w;
 
 
-      outputRight[
-        Math.max(
-          0,
-          destinationIndex -
-          TRIM
-        )
+      vocalsRight[
+        start + s
       ] +=
-        stem.right[
-          sourceIndex
-        ] *
-        COMPENSATION *
+        vocalRight *
+        w;
+
+
+      weight[
+        start + s
+      ] +=
         w;
 
     }
 
-
-    /*
-     * weight
-     *
-     * ここでは簡易的にチャンクの有効範囲を
-     * 正規化する。
-     */
-
-    const weightStart =
-      Math.max(
-        0,
-        sourceStart
-      );
-
-
-    const weightEnd =
-      Math.min(
-        total,
-        sourceStart +
-        CHUNK_SIZE
-      );
-
-
-    for (
-      let i = weightStart;
-      i < weightEnd;
-      i++
-    ) {
-
-      weight[i] += 1;
-
-    }
-
-
-    /*
-     * Safariに処理を返す。
-     *
-     * これが重要。
-     * 長時間JSを占有し続けない。
-     */
 
     onProgress(
       (chunkIndex + 1) /
@@ -1152,14 +1179,18 @@ async function separateWithMDX(
     );
 
 
+    /*
+      Safariに制御を返す。
+    */
+
     await waitForBrowser();
 
   }
 
 
-  // ----------------------------------------------------------
-  // Normalize
-  // ----------------------------------------------------------
+  // ==========================================================
+  // Overlap-add正規化
+  // ==========================================================
 
   for (
     let i = 0;
@@ -1170,1179 +1201,83 @@ async function separateWithMDX(
     const w =
       Math.max(
         weight[i],
-        1
+        1e-8
       );
 
 
-    outputLeft[i] /=
+    vocalsLeft[i] /=
       w;
 
 
-    outputRight[i] /=
+    vocalsRight[i] /=
       w;
-
-  }
-
-
-  /*
-   * instrumental
-   */
-
-  const instrumentalLeft =
-    outputLeft.slice(
-      0,
-      total
-    );
-
-  const instrumentalRight =
-    outputRight.slice(
-      0,
-      total
-    );
-
-
-  /*
-   * vocals = original - instrumental
-   */
-
-  const vocalsLeft =
-    new Float32Array(
-      total
-    );
-
-  const vocalsRight =
-    new Float32Array(
-      total
-    );
-
-
-  for (
-    let i = 0;
-    i < total;
-    i++
-  ) {
-
-    vocalsLeft[i] =
-      originalLeft[i] -
-      instrumentalLeft[i];
-
-
-    vocalsRight[i] =
-      originalRight[i] -
-      instrumentalRight[i];
 
   }
 
 
   return {
-
-    vocals: {
-      left:
-        vocalsLeft,
-
-      right:
-        vocalsRight
-    },
-
-    instrumental: {
-      left:
-        instrumentalLeft,
-
-      right:
-        instrumentalRight
-    }
-
-  };
-
-}
-
-
-// ============================================================
-// STFT
-// ============================================================
-
-function createMDXSpectrum(
-  left,
-  right
-) {
-
-  const result =
-    new Float32Array(
-      4 *
-      DIM_F *
-      DIM_T
-    );
-
-
-  const window =
-    makeHannWindow(
-      N_FFT
-    );
-
-
-  /*
-   * center=True
-   *
-   * 3072 samplesを左右にpadding。
-   */
-
-  const paddedLeft =
-    new Float32Array(
-      CHUNK_SIZE +
-      N_FFT
-    );
-
-  const paddedRight =
-    new Float32Array(
-      CHUNK_SIZE +
-      N_FFT
-    );
-
-
-  paddedLeft.set(
-    left,
-    TRIM
-  );
-
-  paddedRight.set(
-    right,
-    TRIM
-  );
-
-
-  /*
-   * 6144-point FFT
-   *
-   * 6144 = 3 × 2048
-   */
-
-  const real =
-    new Float32Array(
-      N_FFT
-    );
-
-  const imag =
-    new Float32Array(
-      N_FFT
-    );
-
-
-  for (
-    let frame = 0;
-    frame < DIM_T;
-    frame++
-  ) {
-
-    const offset =
-      frame *
-      HOP;
-
-
-    // --------------------------------------------------------
-    // Left
-    // --------------------------------------------------------
-
-    real.fill(0);
-    imag.fill(0);
-
-
-    for (
-      let i = 0;
-      i < N_FFT;
-      i++
-    ) {
-
-      real[i] =
-        paddedLeft[
-          offset + i
-        ] *
-        window[i];
-
-    }
-
-
-    fft6144(
-      real,
-      imag,
-      false
-    );
-
-
-    for (
-      let bin = 0;
-      bin < DIM_F;
-      bin++
-    ) {
-
-      const index =
-        bin *
-        DIM_T +
-        frame;
-
-
-      result[index] =
-        real[bin];
-
-
-      result[
-        DIM_F *
-        DIM_T +
-        index
-      ] =
-        imag[bin];
-
-    }
-
-
-    // --------------------------------------------------------
-    // Right
-    // --------------------------------------------------------
-
-    real.fill(0);
-    imag.fill(0);
-
-
-    for (
-      let i = 0;
-      i < N_FFT;
-      i++
-    ) {
-
-      real[i] =
-        paddedRight[
-          offset + i
-        ] *
-        window[i];
-
-    }
-
-
-    fft6144(
-      real,
-      imag,
-      false
-    );
-
-
-    const rightRealOffset =
-      2 *
-      DIM_F *
-      DIM_T;
-
-
-    const rightImagOffset =
-      3 *
-      DIM_F *
-      DIM_T;
-
-
-    for (
-      let bin = 0;
-      bin < DIM_F;
-      bin++
-    ) {
-
-      const index =
-        bin *
-        DIM_T +
-        frame;
-
-
-      result[
-        rightRealOffset +
-        index
-      ] =
-        real[bin];
-
-
-      result[
-        rightImagOffset +
-        index
-      ] =
-        imag[bin];
-
-    }
-
-  }
-
-
-  return result;
-
-}
-
-
-// ============================================================
-// iSTFT
-// ============================================================
-
-function mdxSpectrumToAudio(
-  data
-) {
-
-  const paddedLength =
-    CHUNK_SIZE +
-    N_FFT;
-
-
-  const left =
-    new Float32Array(
-      paddedLength
-    );
-
-  const right =
-    new Float32Array(
-      paddedLength
-    );
-
-
-  const norm =
-    new Float32Array(
-      paddedLength
-    );
-
-
-  const window =
-    makeHannWindow(
-      N_FFT
-    );
-
-
-  const real =
-    new Float32Array(
-      N_FFT
-    );
-
-  const imag =
-    new Float32Array(
-      N_FFT
-    );
-
-
-  const leftImagOffset =
-    DIM_F *
-    DIM_T;
-
-
-  const rightRealOffset =
-    2 *
-    DIM_F *
-    DIM_T;
-
-
-  const rightImagOffset =
-    3 *
-    DIM_F *
-    DIM_T;
-
-
-  for (
-    let frame = 0;
-    frame < DIM_T;
-    frame++
-  ) {
-
-    // --------------------------------------------------------
-    // Left
-    // --------------------------------------------------------
-
-    real.fill(0);
-    imag.fill(0);
-
-
-    for (
-      let bin = 0;
-      bin < DIM_F;
-      bin++
-    ) {
-
-      const index =
-        bin *
-        DIM_T +
-        frame;
-
-
-      real[bin] =
-        data[index];
-
-
-      imag[bin] =
-        data[
-          leftImagOffset +
-          index
-        ];
-
-    }
-
-
-    reconstructConjugateSpectrum(
-      real,
-      imag
-    );
-
-
-    fft6144(
-      real,
-      imag,
-      true
-    );
-
-
-    const offset =
-      frame *
-      HOP;
-
-
-    for (
-      let i = 0;
-      i < N_FFT;
-      i++
-    ) {
-
-      const w =
-        window[i];
-
-
-      left[
-        offset + i
-      ] +=
-        real[i] *
-        w;
-
-
-      norm[
-        offset + i
-      ] +=
-        w *
-        w;
-
-    }
-
-
-    // --------------------------------------------------------
-    // Right
-    // --------------------------------------------------------
-
-    real.fill(0);
-    imag.fill(0);
-
-
-    for (
-      let bin = 0;
-      bin < DIM_F;
-      bin++
-    ) {
-
-      const index =
-        bin *
-        DIM_T +
-        frame;
-
-
-      real[bin] =
-        data[
-          rightRealOffset +
-          index
-        ];
-
-
-      imag[bin] =
-        data[
-          rightImagOffset +
-          index
-        ];
-
-    }
-
-
-    reconstructConjugateSpectrum(
-      real,
-      imag
-    );
-
-
-    fft6144(
-      real,
-      imag,
-      true
-    );
-
-
-    for (
-      let i = 0;
-      i < N_FFT;
-      i++
-    ) {
-
-      right[
-        offset + i
-      ] +=
-        real[i] *
-        window[i];
-
-    }
-
-  }
-
-
-  const outputLeft =
-    new Float32Array(
-      CHUNK_SIZE
-    );
-
-  const outputRight =
-    new Float32Array(
-      CHUNK_SIZE
-    );
-
-
-  for (
-    let i = 0;
-    i < CHUNK_SIZE;
-    i++
-  ) {
-
-    const source =
-      i +
-      TRIM;
-
-
-    const n =
-      Math.max(
-        norm[source],
-        1e-7
-      );
-
-
-    outputLeft[i] =
-      left[source] /
-      n;
-
-
-    outputRight[i] =
-      right[source] /
-      n;
-
-  }
-
-
-  return {
-
     left:
-      outputLeft,
+      vocalsLeft,
 
     right:
-      outputRight
-
+      vocalsRight
   };
 
 }
 
 
 // ============================================================
-// Spectrum reconstruction
+// Instrumental
 // ============================================================
 
-function reconstructConjugateSpectrum(
-  real,
-  imag
+function subtractVocals(
+  originalLeft,
+  originalRight,
+  vocalsLeft,
+  vocalsRight
 ) {
 
-  /*
-   * DIM_F = 3072
-   *
-   * n_fft/2 = 3072
-   *
-   * Nyquist bin 3072 is set to zero.
-   *
-   * The negative-frequency half is reconstructed.
-   */
+  const length =
+    originalLeft.length;
 
-  real[DIM_F] = 0;
-  imag[DIM_F] = 0;
 
-
-  for (
-    let bin = 1;
-    bin < DIM_F;
-    bin++
-  ) {
-
-    const mirror =
-      N_FFT -
-      bin;
-
-
-    real[mirror] =
-      real[bin];
-
-
-    imag[mirror] =
-      -imag[bin];
-
-  }
-
-}
-
-
-// ============================================================
-// 6144 FFT
-// ============================================================
-
-function fft6144(
-  real,
-  imag,
-  inverse
-) {
-
-  /*
-   * 6144 = 3 × 2048
-   *
-   * Split into three 2048-point FFTs.
-   */
-
-  const N =
-    6144;
-
-  const M =
-    2048;
-
-
-  const aReal =
-    new Float32Array(M);
-
-  const aImag =
-    new Float32Array(M);
-
-  const bReal =
-    new Float32Array(M);
-
-  const bImag =
-    new Float32Array(M);
-
-  const cReal =
-    new Float32Array(M);
-
-  const cImag =
-    new Float32Array(M);
-
-
-  for (
-    let i = 0;
-    i < M;
-    i++
-  ) {
-
-    aReal[i] =
-      real[
-        i * 3
-      ];
-
-    aImag[i] =
-      imag[
-        i * 3
-      ];
-
-
-    bReal[i] =
-      real[
-        i * 3 + 1
-      ];
-
-    bImag[i] =
-      imag[
-        i * 3 + 1
-      ];
-
-
-    cReal[i] =
-      real[
-        i * 3 + 2
-      ];
-
-    cImag[i] =
-      imag[
-        i * 3 + 2
-      ];
-
-  }
-
-
-  fft2048(
-    aReal,
-    aImag,
-    inverse
-  );
-
-
-  fft2048(
-    bReal,
-    bImag,
-    inverse
-  );
-
-
-  fft2048(
-    cReal,
-    cImag,
-    inverse
-  );
-
-
-  const sign =
-    inverse
-      ? 1
-      : -1;
-
-
-  for (
-    let k = 0;
-    k < M;
-    k++
-  ) {
-
-    const angle =
-      sign *
-      2 *
-      Math.PI *
-      k /
-      N;
-
-
-    const w1r =
-      Math.cos(angle);
-
-    const w1i =
-      Math.sin(angle);
-
-
-    const w2r =
-      Math.cos(
-        angle * 2
-      );
-
-    const w2i =
-      Math.sin(
-        angle * 2
-      );
-
-
-    const br =
-      bReal[k] *
-      w1r -
-      bImag[k] *
-      w1i;
-
-
-    const bi =
-      bReal[k] *
-      w1i +
-      bImag[k] *
-      w1r;
-
-
-    const cr =
-      cReal[k] *
-      w2r -
-      cImag[k] *
-      w2i;
-
-
-    const ci =
-      cReal[k] *
-      w2i +
-      cImag[k] *
-      w2r;
-
-
-    const x0r =
-      aReal[k] +
-      br +
-      cr;
-
-
-    const x0i =
-      aImag[k] +
-      bi +
-      ci;
-
-
-    const x1r =
-      aReal[k] +
-      br * COS120 -
-      bi * SIN120 +
-      cr * COS240 -
-      ci * SIN240;
-
-
-    const x1i =
-      aImag[k] +
-      br * SIN120 +
-      bi * COS120 +
-      cr * SIN240 +
-      ci * COS240;
-
-
-    const x2r =
-      aReal[k] +
-      br * COS240 -
-      bi * SIN240 +
-      cr * COS120 -
-      ci * SIN120;
-
-
-    const x2i =
-      aImag[k] +
-      br * SIN240 +
-      bi * COS240 +
-      cr * SIN120 +
-      ci * COS120;
-
-
-    real[k] =
-      x0r;
-
-    imag[k] =
-      x0i;
-
-
-    real[k + M] =
-      x1r;
-
-    imag[k + M] =
-      x1i;
-
-
-    real[k + M * 2] =
-      x2r;
-
-    imag[k + M * 2] =
-      x2i;
-
-  }
-
-
-  if (inverse) {
-
-    for (
-      let i = 0;
-      i < N;
-      i++
-    ) {
-
-      real[i] /=
-        N;
-
-      imag[i] /=
-        N;
-
-    }
-
-  }
-
-}
-
-
-const COS120 =
-  -0.5;
-
-const SIN120 =
-  Math.sqrt(3) / 2;
-
-const COS240 =
-  -0.5;
-
-const SIN240 =
-  -Math.sqrt(3) / 2;
-
-
-// ============================================================
-// 2048 FFT
-// ============================================================
-
-function fft2048(
-  real,
-  imag,
-  inverse
-) {
-
-  const N =
-    2048;
-
-
-  // Bit reversal
-  let j = 0;
-
-
-  for (
-    let i = 1;
-    i < N;
-    i++
-  ) {
-
-    let bit =
-      N >> 1;
-
-
-    while (
-      j & bit
-    ) {
-
-      j ^=
-        bit;
-
-      bit >>=
-        1;
-
-    }
-
-
-    j ^=
-      bit;
-
-
-    if (
-      i < j
-    ) {
-
-      let temp =
-        real[i];
-
-      real[i] =
-        real[j];
-
-      real[j] =
-        temp;
-
-
-      temp =
-        imag[i];
-
-      imag[i] =
-        imag[j];
-
-      imag[j] =
-        temp;
-
-    }
-
-  }
-
-
-  for (
-    let len = 2;
-    len <= N;
-    len <<= 1
-  ) {
-
-    const angle =
-      (
-        inverse
-          ? 2
-          : -2
-      ) *
-      Math.PI /
-      len;
-
-
-    const wr0 =
-      Math.cos(angle);
-
-    const wi0 =
-      Math.sin(angle);
-
-
-    const half =
-      len >> 1;
-
-
-    for (
-      let start = 0;
-      start < N;
-      start += len
-    ) {
-
-      let wr = 1;
-      let wi = 0;
-
-
-      for (
-        let k = 0;
-        k < half;
-        k++
-      ) {
-
-        const i =
-          start +
-          k;
-
-        const p =
-          i +
-          half;
-
-
-        const vr =
-          real[p] *
-          wr -
-          imag[p] *
-          wi;
-
-
-        const vi =
-          real[p] *
-          wi +
-          imag[p] *
-          wr;
-
-
-        const ur =
-          real[i];
-
-        const ui =
-          imag[i];
-
-
-        real[i] =
-          ur +
-          vr;
-
-        imag[i] =
-          ui +
-          vi;
-
-
-        real[p] =
-          ur -
-          vr;
-
-        imag[p] =
-          ui -
-          vi;
-
-
-        const nextWr =
-          wr *
-          wr0 -
-          wi *
-          wi0;
-
-
-        wi =
-          wr *
-          wi0 +
-          wi *
-          wr0;
-
-
-        wr =
-          nextWr;
-
-      }
-
-    }
-
-  }
-
-}
-
-
-// ============================================================
-// Hann
-// ============================================================
-
-function makeHannWindow(
-  size
-) {
-
-  const window =
-    new Float32Array(
-      size
-    );
-
-
-  for (
-    let i = 0;
-    i < size;
-    i++
-  ) {
-
-    window[i] =
-      0.5 *
-      (
-        1 -
-        Math.cos(
-          2 *
-          Math.PI *
-          i /
-          size
-        )
-      );
-
-  }
-
-
-  return window;
-
-}
-
-
-// ============================================================
-// Blend window
-// ============================================================
-
-function createBlendWindow(
-  length,
-  overlap
-) {
-
-  const window =
+  const instrumentalLeft =
     new Float32Array(
       length
     );
 
 
-  window.fill(1);
-
-
-  const fade =
-    Math.min(
-      overlap,
-      Math.floor(
-        length / 2
-      )
+  const instrumentalRight =
+    new Float32Array(
+      length
     );
 
 
   for (
     let i = 0;
-    i < fade;
+    i < length;
     i++
   ) {
 
-    const x =
-      i /
-      fade;
+    instrumentalLeft[i] =
+      originalLeft[i] -
+      vocalsLeft[i];
 
 
-    window[i] =
-      0.5 -
-      0.5 *
-      Math.cos(
-        Math.PI *
-        x
-      );
-
-
-    window[
-      length -
-      1 -
-      i
-    ] =
-      window[i];
+    instrumentalRight[i] =
+      originalRight[i] -
+      vocalsRight[i];
 
   }
 
 
-  return window;
+  return {
+    left:
+      instrumentalLeft,
+
+    right:
+      instrumentalRight
+  };
 
 }
 
@@ -2352,13 +1287,9 @@ function createBlendWindow(
 // ============================================================
 
 async function audioToMidi(
-
   basicPitch,
-
   stereo,
-
   onProgress
-
 ) {
 
   const audioBuffer =
@@ -2468,6 +1399,13 @@ async function audioToMidi(
     new Midi();
 
 
+  /*
+    MIDI tempoは120 BPM固定。
+
+    ノートのtime/durationは秒ベースで
+    Basic Pitchの実時間を維持する。
+  */
+
   midi.header.setTempo(
     MIDI_BPM
   );
@@ -2478,7 +1416,8 @@ async function audioToMidi(
 
 
   for (
-    const note of timedNotes
+    const note
+    of timedNotes
   ) {
 
     const pitch =
@@ -2507,8 +1446,7 @@ async function audioToMidi(
         Math.min(
           1,
           Number(
-            note.amplitude ??
-            0.8
+            note.amplitude ?? 0.8
           )
         )
       );
@@ -2547,7 +1485,8 @@ async function createBasicPitchAudioBuffer(
 ) {
 
   const sourceRate =
-    SAMPLE_RATE;
+    DEMUCS_SAMPLE_RATE;
+
 
   const targetRate =
     BASIC_PITCH_SAMPLE_RATE;
@@ -2562,6 +1501,12 @@ async function createBasicPitchAudioBuffer(
       length
     );
 
+
+  /*
+    ステレオ → モノラル。
+
+    ここでは左右を平均する。
+  */
 
   for (
     let i = 0;
@@ -2581,6 +1526,7 @@ async function createBasicPitchAudioBuffer(
 
   const sourceBuffer =
     new AudioBuffer({
+
       length:
         length,
 
@@ -2589,6 +1535,7 @@ async function createBasicPitchAudioBuffer(
 
       sampleRate:
         sourceRate
+
     });
 
 
@@ -2598,9 +1545,12 @@ async function createBasicPitchAudioBuffer(
 
 
   const targetLength =
-    Math.ceil(
-      sourceBuffer.duration *
-      targetRate
+    Math.max(
+      1,
+      Math.ceil(
+        sourceBuffer.duration *
+        targetRate
+      )
     );
 
 
@@ -2638,7 +1588,7 @@ async function createBasicPitchAudioBuffer(
 
 
 // ============================================================
-// MIDI normalization
+// MIDI Note Normalization
 // ============================================================
 
 function normalizeNoteObjects(
@@ -2704,7 +1654,7 @@ function normalizeNoteObjects(
 
 
 // ============================================================
-// Merge same pitch
+// 同音ノート結合
 // ============================================================
 
 function mergeSamePitchNotes(
@@ -2735,7 +1685,8 @@ function mergeSamePitchNotes(
 
 
   for (
-    const note of sorted
+    const note
+    of sorted
   ) {
 
     const previous =
@@ -2816,7 +1767,7 @@ function mergeSamePitchNotes(
 
 
 // ============================================================
-// Remove short notes
+// 短すぎるノート削除
 // ============================================================
 
 function removeShortNotes(
@@ -2833,7 +1784,7 @@ function removeShortNotes(
 
 
 // ============================================================
-// Fill small gaps
+// 小さい隙間を埋める
 // ============================================================
 
 function fillSmallGaps(
@@ -2902,5 +1853,53 @@ function fillSmallGaps(
 
 
   return sorted;
+
+}
+
+
+// ============================================================
+// Demucs Transition Window
+// ============================================================
+
+function makeTransitionWindow(
+  segment,
+  overlap
+) {
+
+  const window =
+    new Float32Array(
+      segment
+    );
+
+
+  window.fill(1);
+
+
+  for (
+    let i = 0;
+    i < overlap;
+    i++
+  ) {
+
+    const value =
+      i /
+      overlap;
+
+
+    window[i] =
+      value;
+
+
+    window[
+      segment -
+      1 -
+      i
+    ] =
+      value;
+
+  }
+
+
+  return window;
 
 }
